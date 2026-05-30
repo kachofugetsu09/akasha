@@ -278,7 +278,7 @@ class AkashaMemoryEngine:
             skip_pairs=dense_pairs,
         )
         text_block = (
-            self._format_context_block(dense_cards, ripple_cards)
+            self._format_context_block(dense_cards, ripple_cards, now_ts=now_ts)
             if request.intent == "context"
             else ""
         )
@@ -942,11 +942,14 @@ class AkashaMemoryEngine:
         self,
         dense_cards: list[AkashaCard],
         ripple_cards: list[AkashaCard],
+        *,
+        now_ts: float,
     ) -> str:
         # 1. Dense 块优先展示重叠项，Ripple 块只展示 ripple-only。
         parts: list[str] = []
         if dense_cards or ripple_cards:
-            parts.append(f"# Akasha memory now={datetime.now().astimezone().strftime('%Y-%m-%d')}")
+            date_label = datetime.fromtimestamp(now_ts, timezone.utc).astimezone().strftime("%Y-%m-%d")
+            parts.append(f"# Akasha memory now={date_label}")
         if dense_cards:
             parts.append(_format_cards("## 左脑记忆：精确回忆", _sort_cards_by_time(dense_cards)))
         if ripple_cards:

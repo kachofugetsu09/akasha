@@ -25,7 +25,7 @@ from plugins.akasha.config import (
     load_akasha_config,
     resolve_akasha_db_path,
 )
-from plugins.akasha.core import SourceMessage, turn_key
+from plugins.akasha.core import SourceMessage, parse_ts_unix, turn_key
 from plugins.akasha.replay import AkashaReplayRuntime, ReplayMessage
 from plugins.akasha.store import (
     AkashaStore,
@@ -80,14 +80,13 @@ def _iter_source_batches(
     sessions_db: Path,
     batch_size: int,
 ) -> Iterator[list[SourceMessage]]:
-    # 1. 按真实时间顺序 replay，避免后来的 turn 提前进入历史图。
+    # 1. 先批量读取，最终统一用核心时间解析器排序。
     with closing(sqlite3.connect(str(sessions_db))) as db:
         cursor = db.execute(
             """
             SELECT id, session_key, seq, role, content, ts
             FROM messages
             WHERE role IN ('user', 'assistant')
-            ORDER BY COALESCE(datetime(ts), ts), session_key, seq
             """
         )
         while rows := cursor.fetchmany(max(1, batch_size)):
@@ -109,6 +108,7 @@ def _load_source_messages(sessions_db: Path) -> list[SourceMessage]:
     messages: list[SourceMessage] = []
     for batch in _iter_source_batches(sessions_db=sessions_db, batch_size=1000):
         messages.extend(batch)
+    messages.sort(key=lambda item: (parse_ts_unix(item.ts), item.session_key, item.seq))
     return messages
 
 
@@ -245,6 +245,7 @@ def _run() -> MigrationStats:
     activations = 0
     cache_hits = 0
     cache_misses = 0
+    next_progress = int(args.progress_every)
     status = "failed"
     try:
         source_messages = _load_source_messages(sessions_db)
@@ -269,6 +270,7 @@ def _run() -> MigrationStats:
             runtime = AkashaReplayRuntime(
                 store=store,
                 config=akasha_config,
+                source_db_path=sessions_db,
                 source_cursor=source_db.cursor(),
                 message_embeddings=message_embeddings,
                 message_turn_keys=message_turn_keys,
@@ -288,8 +290,10 @@ def _run() -> MigrationStats:
                 result = runtime.replay_turn(replay_items)
                 activations += len(result.activation_items)
                 messages += len(replay_items)
-                if args.progress_every > 0 and messages % int(args.progress_every) == 0:
-                    print(f"已处理 messages={messages} activations={activations}")
+                if next_progress > 0 and messages >= next_progress:
+                    print(f"已处理 messages={messages} activations={activations}", flush=True)
+                    while messages >= next_progress:
+                        next_progress += int(args.progress_every)
         status = "completed"
     finally:
         store.finish_migration_run(

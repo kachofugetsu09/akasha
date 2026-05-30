@@ -769,30 +769,26 @@ class AkashaStore:
         ripple_items_json: str,
         text_block_preview: str,
     ) -> None:
-        # 1. 写失败不中断主链路，只记录到 warning。
-        import logging
-        try:
-            with self._lock:
-                _ = self._db.execute(
-                    """
-                    INSERT OR REPLACE INTO akasha_query_log (
-                        query_id, session_key, seq, query_text, intent, ts,
-                        seed_count, pool_count, activated_count, activation_threshold,
-                        dense_count, ripple_count, inject_chars, source_ref_count,
-                        activation_items, dense_items, ripple_items, text_block_preview
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        query_id, session_key, seq, query_text, intent, ts,
-                        seed_count, pool_count, activated_count, activation_threshold,
-                        dense_count, ripple_count, inject_chars, source_ref_count,
-                        activation_items_json, dense_items_json, ripple_items_json,
-                        text_block_preview,
-                    ),
-                )
-                self._db.commit()
-        except Exception:
-            logging.getLogger("akasha.store").warning("insert_query_log failed", exc_info=True)
+        # 1. 诊断日志是可验收状态，写失败要直接暴露。
+        with self._lock:
+            _ = self._db.execute(
+                """
+                INSERT OR REPLACE INTO akasha_query_log (
+                    query_id, session_key, seq, query_text, intent, ts,
+                    seed_count, pool_count, activated_count, activation_threshold,
+                    dense_count, ripple_count, inject_chars, source_ref_count,
+                    activation_items, dense_items, ripple_items, text_block_preview
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    query_id, session_key, seq, query_text, intent, ts,
+                    seed_count, pool_count, activated_count, activation_threshold,
+                    dense_count, ripple_count, inject_chars, source_ref_count,
+                    activation_items_json, dense_items_json, ripple_items_json,
+                    text_block_preview,
+                ),
+            )
+            self._db.commit()
 
     # 读取检索诊断日志列表（仅轻量字段）。
     def list_query_logs(

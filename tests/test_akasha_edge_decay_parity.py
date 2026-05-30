@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -22,7 +23,7 @@ import plugins.akasha.core as core
 from core.memory.engine import MemoryQuery, MemoryScope
 from plugins.akasha.config import AkashaConfig
 from plugins.akasha.engine import AkashaMemoryEngine, PendingActivation
-from plugins.akasha.replay import AkashaReplayRuntime, ReplayMessage
+from plugins.akasha.replay import AkashaReplayRuntime, ReplayMessage, _turn_messages
 from plugins.akasha.store import AkashaStore
 
 
@@ -154,6 +155,7 @@ def test_replay_and_runtime_use_same_directional_stdp_edges(tmp_path: Path) -> N
             replay = AkashaReplayRuntime(
                 store=replay_store,
                 config=AkashaConfig(),
+                source_db_path=tmp_path / "sessions.db",
                 source_cursor=source_db.cursor(),
                 message_embeddings={},
                 message_turn_keys={},
@@ -221,6 +223,7 @@ def test_runtime_and_replay_use_same_decayed_edges(
             replay = AkashaReplayRuntime(
                 store=replay_store,
                 config=AkashaConfig(dense_seed_threshold=0.1, nearby_dense_threshold=0.0),
+                source_db_path=tmp_path / "sessions.db",
                 source_cursor=source_db.cursor(),
                 message_embeddings=_message_embeddings(replay_store),
                 message_turn_keys=_message_turn_keys(),
@@ -237,6 +240,110 @@ def test_runtime_and_replay_use_same_decayed_edges(
     assert calls["replay"] > 0
     assert _shape(runtime_result.activation_items) == _shape(replay_items)
     assert _scores(runtime_result.activation_items) == pytest.approx(_scores(replay_items))
+
+
+def test_replay_writes_query_log_with_activation_items(tmp_path: Path) -> None:
+    _init_sessions_db(tmp_path / "sessions.db")
+    replay_store = _seed_store(tmp_path / "replay.db")
+    try:
+        with closing(sqlite3.connect(str(tmp_path / "sessions.db"))) as source_db:
+            replay = AkashaReplayRuntime(
+                store=replay_store,
+                config=AkashaConfig(dense_seed_threshold=0.1, nearby_dense_threshold=0.0),
+                source_db_path=tmp_path / "sessions.db",
+                source_cursor=source_db.cursor(),
+                message_embeddings=_message_embeddings(replay_store),
+                message_turn_keys=_message_turn_keys(),
+            )
+            result = replay.replay_turn([
+                ReplayMessage(
+                    core.SourceMessage("m4", "s", 4, "user", "alpha", NOW_ISO, 0.0),
+                    [1.0, 0.0],
+                )
+            ])
+
+        rows, total = replay_store.list_query_logs(session_key="s", page=1, page_size=10)
+        assert total == 1
+        raw = replay_store.get_query_log(str(rows[0]["query_id"]))
+        assert raw is not None
+        activation_items = json.loads(str(raw["activation_items_json"]))
+        dense_items = json.loads(str(raw["dense_items_json"]))
+        ripple_items = json.loads(str(raw["ripple_items_json"]))
+        assert str(rows[0]["query_id"]).startswith("s:4:context:")
+        assert rows[0]["intent"] == "context"
+        assert rows[0]["activated_count"] == len(result.activation_items)
+        assert rows[0]["dense_count"] == len(dense_items)
+        assert rows[0]["ripple_count"] == len(ripple_items)
+        assert raw["text_block_preview"]
+        assert activation_items
+        assert dense_items
+        assert isinstance(ripple_items, list)
+        assert activation_items[0]["user_message"] in {"alpha", "beta"}
+    finally:
+        replay_store.close()
+
+
+def test_replay_empty_query_commits_without_activation_or_query_log(tmp_path: Path) -> None:
+    _init_sessions_db(tmp_path / "sessions.db")
+    replay_store = _seed_store(tmp_path / "replay.db")
+    try:
+        with closing(sqlite3.connect(str(tmp_path / "sessions.db"))) as source_db:
+            replay = AkashaReplayRuntime(
+                store=replay_store,
+                config=AkashaConfig(dense_seed_threshold=0.1, nearby_dense_threshold=0.0),
+                source_db_path=tmp_path / "sessions.db",
+                source_cursor=source_db.cursor(),
+                message_embeddings=_message_embeddings(replay_store),
+                message_turn_keys=_message_turn_keys(),
+            )
+            result = replay.replay_turn([
+                ReplayMessage(
+                    core.SourceMessage("m4", "s", 4, "user", "", NOW_ISO, 0.0),
+                    [0.0, 0.0],
+                )
+            ])
+
+        rows, total = replay_store.list_query_logs(session_key="s", page=1, page_size=10)
+        assert result.current_key == "s:4"
+        assert result.activation_items == []
+        assert total == 0
+        assert rows == []
+        with closing(sqlite3.connect(str(tmp_path / "replay.db"))) as db:
+            assert db.execute("SELECT COUNT(*) FROM akasha_activation_events").fetchone()[0] == 0
+    finally:
+        replay_store.close()
+
+
+def test_query_log_content_loader_allows_empty_user_message(tmp_path: Path) -> None:
+    with closing(sqlite3.connect(str(tmp_path / "sessions.db"))) as db:
+        db.execute(
+            """
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                ts TEXT NOT NULL
+            )
+            """
+        )
+        db.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("m0", "s", 0, "user", "", T0_ISO),
+                ("m1", "s", 1, "assistant", "assistant preview", T0_ISO),
+            ],
+        )
+        db.commit()
+        user_message, assistant_preview = _turn_messages(
+            db.cursor(),
+            "s:0",
+            assistant_preview_chars=9,
+        )
+
+    assert user_message == ""
+    assert assistant_preview == "assistant..."
 
 
 def test_store_and_runtime_cache_apply_same_edge_decay(tmp_path: Path) -> None:
@@ -301,6 +408,7 @@ def test_replay_and_online_write_same_causal_salience(tmp_path: Path) -> None:
             replay = AkashaReplayRuntime(
                 store=replay_store,
                 config=AkashaConfig(),
+                source_db_path=tmp_path / "sessions.db",
                 source_cursor=source_db.cursor(),
                 message_embeddings={},
                 message_turn_keys={},
