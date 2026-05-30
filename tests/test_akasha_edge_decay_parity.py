@@ -21,7 +21,7 @@ sys.path.append(str(HOST_ROOT))
 import plugins.akasha.core as core
 from core.memory.engine import MemoryQuery, MemoryScope
 from plugins.akasha.config import AkashaConfig
-from plugins.akasha.engine import AkashaMemoryEngine
+from plugins.akasha.engine import AkashaMemoryEngine, PendingActivation
 from plugins.akasha.replay import AkashaReplayRuntime, ReplayMessage
 from plugins.akasha.store import AkashaStore
 
@@ -120,9 +120,67 @@ def _node_salience(store: AkashaStore, key: str) -> float:
     return node.salience
 
 
+def _candidate(key: str, score: float) -> core.AkashaCandidate:
+    return core.AkashaCandidate(
+        key=key,
+        source="Dense",
+        ripple=0.0,
+        direct=score,
+        state=0.0,
+        edge=0.0,
+        long=0.0,
+        resource=1.0,
+        fan=0,
+        score=score,
+    )
+
+
 def test_parse_ts_unix_rejects_non_iso_timestamp() -> None:
     with pytest.raises(ValueError):
         core.parse_ts_unix(str(T0))
+
+
+def test_replay_and_runtime_use_same_directional_stdp_edges(tmp_path: Path) -> None:
+    candidate = _candidate("s:0", 0.8)
+    expected = {
+        (item.src_key, item.dst_key): 0.12 * item.strength
+        for item in core.activation_edge_updates("s:2", [candidate], T0)
+    }
+
+    replay_store = AkashaStore(tmp_path / "replay.db")
+    runtime_store = AkashaStore(tmp_path / "runtime.db")
+    try:
+        with closing(sqlite3.connect(":memory:")) as source_db:
+            replay = AkashaReplayRuntime(
+                store=replay_store,
+                config=AkashaConfig(),
+                source_cursor=source_db.cursor(),
+                message_embeddings={},
+                message_turn_keys={},
+            )
+            replay.commit_turn(
+                [ReplayMessage(core.SourceMessage("m2", "s", 2, "user", "beta", T0_ISO), [1.0, 0.0])],
+                [candidate],
+            )
+
+        engine = cast(Any, AkashaMemoryEngine.__new__(AkashaMemoryEngine))
+        engine._store = runtime_store
+        engine._graph_lock = threading.RLock()
+        engine._edges = {}
+        engine._edges_meta = {}
+        engine._edges_by_src = {}
+        engine._fan = {}
+        engine._commit_pending_activation(
+            "s:2",
+            PendingActivation(query_id="q", seq=2, ts=T0, items=[candidate]),
+        )
+
+        assert replay_store.load_edges() == pytest.approx(expected)
+        assert runtime_store.load_edges() == pytest.approx(expected)
+        assert expected[("s:0", "s:2")] > expected[("s:2", "s:0")]
+    finally:
+        replay_store.close()
+        runtime_store.close()
 
 
 def test_runtime_and_replay_use_same_decayed_edges(

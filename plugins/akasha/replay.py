@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sqlite3
 from dataclasses import dataclass
 from typing import Sequence
@@ -13,8 +12,8 @@ from plugins.akasha.core import (
     AkashaActivationSnapshot,
     AkashaCandidate,
     CoreConfig,
-    EdgeUpdate,
     SourceMessage,
+    activation_edge_updates,
     activation_updates,
     compute_candidates_from_snapshot,
     edges_by_src,
@@ -135,7 +134,7 @@ class AkashaReplayRuntime:
         if current_key and activation_items:
             trigger = next((item.message for item in items if item.message.role == "user"), items[0].message)
             ts = parse_ts_unix(trigger.ts)
-            self._store.upsert_edges(_edge_updates(current_key, activation_items, ts))
+            self._store.upsert_edges(activation_edge_updates(current_key, activation_items, ts))
             self._store.insert_activation_events(_activation_events(trigger, activation_items))
         return current_key
 
@@ -152,26 +151,6 @@ def _core_config(config: AkashaConfig) -> CoreConfig:
         soft_recall_direct_floor=config.soft_recall_direct_floor,
         activate_limit=config.activate_limit,
     )
-
-
-def _edge_updates(
-    current_key: str,
-    candidates: list[AkashaCandidate],
-    ts: float,
-) -> list[EdgeUpdate]:
-    updates: list[EdgeUpdate] = []
-    key_to_score = {item.key: item.score for item in candidates}
-    for item in candidates:
-        edge_strength = key_to_score.get(item.key, 1.0)
-        updates.append(EdgeUpdate(current_key, item.key, edge_strength, ts))
-        updates.append(EdgeUpdate(item.key, current_key, edge_strength, ts))
-    for left_index, left in enumerate(candidates):
-        for right in candidates[left_index + 1:]:
-            edge_strength = math.sqrt(key_to_score[left.key] * key_to_score[right.key])
-            updates.append(EdgeUpdate(left.key, right.key, edge_strength, ts))
-            updates.append(EdgeUpdate(right.key, left.key, edge_strength, ts))
-    return updates
-
 
 def _activation_events(
     message: SourceMessage,

@@ -24,6 +24,9 @@ EDGE_DECAY_TAU = 1209600.0      # 14 天：Hebbian 边衰减
 RESOURCE_USE_RATE = 0.35
 STRENGTH_LR = 0.18
 STRENGTH_CAP = 3.0
+STDP_CAUSAL_EDGE_GAIN = 1.0
+STDP_ACAUSAL_EDGE_GAIN = 0.35
+STDP_COACTIVE_EDGE_GAIN = 1.0
 # 新事件初始 strength：编码即峰值（Ebbinghaus / ACT-R / early-LTP）
 # initial_strength = STRENGTH_CAP × (BASE + SALIENCE_BONUS · σ)
 INITIAL_STRENGTH_BASE = 0.70
@@ -269,6 +272,30 @@ class EdgeUpdate:
     dst_key: str
     strength: float
     ts: float
+
+
+def activation_edge_updates(
+    current_key: str,
+    candidates: list[AkashaCandidate],
+    ts: float,
+) -> list[EdgeUpdate]:
+    updates: list[EdgeUpdate] = []
+    key_to_score = {item.key: item.score for item in candidates}
+    for item in candidates:
+        edge_strength = key_to_score.get(item.key, 1.0)
+        updates.append(
+            EdgeUpdate(item.key, current_key, edge_strength * STDP_CAUSAL_EDGE_GAIN, ts)
+        )
+        updates.append(
+            EdgeUpdate(current_key, item.key, edge_strength * STDP_ACAUSAL_EDGE_GAIN, ts)
+        )
+    for left_index, left in enumerate(candidates):
+        for right in candidates[left_index + 1:]:
+            edge_strength = math.sqrt(key_to_score[left.key] * key_to_score[right.key])
+            edge_strength *= STDP_COACTIVE_EDGE_GAIN
+            updates.append(EdgeUpdate(left.key, right.key, edge_strength, ts))
+            updates.append(EdgeUpdate(right.key, left.key, edge_strength, ts))
+    return updates
 
 
 @dataclass(frozen=True)

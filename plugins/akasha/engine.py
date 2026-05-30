@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import math
 import sqlite3
 import threading
 from contextlib import closing
@@ -33,6 +32,7 @@ from plugins.akasha.core import (
     SourceMessage,
     turn_key,
     # Algorithm functions (aliased with _ prefix for internal convention)
+    activation_edge_updates as _activation_edge_updates,
     activation_updates as _activation_updates,
     compute_candidates as _core_compute_candidates,
     compute_candidates_from_snapshot as _core_compute_candidates_from_snapshot,
@@ -617,26 +617,11 @@ class AkashaMemoryEngine:
         current_key: str,
         pending: PendingActivation,
     ) -> None:
-        # 1. 当前输入和被激活旧节点互连，形成后续桥接能力。
-        key_to_score = {item.key: item.score for item in pending.items}
-        edge_updates: list[EdgeUpdate] = []
-        for item in pending.items:
-            edge_strength = key_to_score.get(item.key, 1.0)
-            edge_updates.append(EdgeUpdate(current_key, item.key, edge_strength, pending.ts))
-            edge_updates.append(EdgeUpdate(item.key, current_key, edge_strength, pending.ts))
-
-        # 2. 同轮共同激活的旧节点互连，保持 cross CLI 的共激活语义。
-        for left_index, left in enumerate(pending.items):
-            for right in pending.items[left_index + 1:]:
-                edge_strength = math.sqrt(
-                    key_to_score.get(left.key, 1.0) * key_to_score.get(right.key, 1.0)
-                )
-                edge_updates.append(EdgeUpdate(left.key, right.key, edge_strength, pending.ts))
-                edge_updates.append(EdgeUpdate(right.key, left.key, edge_strength, pending.ts))
+        edge_updates = _activation_edge_updates(current_key, pending.items, pending.ts)
         self._store.upsert_edges(edge_updates)
         self._apply_edge_updates(edge_updates)
 
-        # 3. 记录本轮激活明细，便于之后诊断。
+        # 2. 记录本轮激活明细，便于之后诊断。
         self._store.insert_activation_events([
             ActivationEventRow(
                 seq=pending.seq,
