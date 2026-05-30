@@ -12,6 +12,8 @@ import numpy as np
 from plugins.akasha.core import (
     AkashaNode, ActivationUpdate, EdgeUpdate, ActivationEventRow,
     SourceMessage, turn_key, serialize_f32, deserialize_f32, parse_ts_unix,
+    bounded_add,
+    effective_edge_weight,
     initial_strength,
     normalize as _normalize,
 )
@@ -483,15 +485,26 @@ class AkashaStore:
 
     # 读取全部共激活边。
     def load_edges(self) -> dict[tuple[str, str], float]:
-        # 1. 查询阶段把边转成 dict，便于构造扩散矩阵。
+        edges, _ = self.load_edges_with_meta()
+        return edges
+
+    # 读取全部共激活边和更新时间。
+    def load_edges_with_meta(
+        self,
+    ) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float]]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT src_key, dst_key, weight FROM akasha_edges"
+                "SELECT src_key, dst_key, weight, last_used_ts FROM akasha_edges"
             ).fetchall()
-        return {
+        edges = {
             (str(row["src_key"]), str(row["dst_key"])): float(row["weight"] or 0.0)
             for row in rows
         }
+        meta = {
+            (str(row["src_key"]), str(row["dst_key"])): float(row["last_used_ts"] or 0.0)
+            for row in rows
+        }
+        return edges, meta
 
     # 批量更新被激活节点的长期状态。
     def update_activation_batch(self, updates: list[ActivationUpdate]) -> None:
@@ -539,7 +552,7 @@ class AkashaStore:
                     continue
                 row = self._db.execute(
                     """
-                    SELECT weight, co_count
+                    SELECT weight, co_count, last_used_ts
                     FROM akasha_edges
                     WHERE src_key = ? AND dst_key = ?
                     """,
@@ -552,8 +565,12 @@ class AkashaStore:
                         (item.src_key, item.dst_key, weight, item.ts),
                     )
                     continue
-                old = float(row["weight"] or 0.0) * 0.9995
-                new_weight = old + 0.12 * item.strength * max(0.0, 1.0 - old / 2.0)
+                old = effective_edge_weight(
+                    float(row["weight"] or 0.0),
+                    float(row["last_used_ts"] or 0.0),
+                    item.ts,
+                )
+                new_weight = bounded_add(old, 0.12 * item.strength, 2.0)
                 _ = self._db.execute(
                     """
                     UPDATE akasha_edges

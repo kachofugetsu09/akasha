@@ -79,7 +79,7 @@ class AkashaReplayRuntime:
         if not nodes:
             return []
 
-        edges = self._store.load_edges()
+        edges, edges_meta = self._store.load_edges_with_meta()
         now_ts = parse_ts_unix(message.ts)
         candidates, _, _ = compute_candidates(
             message.content,
@@ -91,6 +91,7 @@ class AkashaReplayRuntime:
             fan=fan_counts(edges),
             source_cursor=self._source_cursor,
             edges_by_src=edges_by_src(edges),
+            edges_meta=edges_meta,
             soft_recall=False,
             return_limit=self._config.activate_limit,
         )

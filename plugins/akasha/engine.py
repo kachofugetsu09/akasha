@@ -37,6 +37,7 @@ from plugins.akasha.core import (
     compute_candidates as _core_compute_candidates,
     dense_message_candidates as _dense_message_candidates,
     edges_by_src as _edges_by_src,
+    effective_edge_weight as _effective_edge_weight,
     fan_counts as _fan_counts,
     parse_turn_key as _parse_turn_key,
     bounded_add as _bounded_add,
@@ -486,7 +487,7 @@ class AkashaMemoryEngine:
         request: MemoryQuery,
     ) -> "_AkashaRetrieval":
         # 1. 准备内存图和当前查询所在的预测 seq。
-        nodes, fan, edges_by_src, message_embeddings, message_turn_keys = self._graph_snapshot()
+        nodes, fan, edges_by_src, edges_meta, message_embeddings, message_turn_keys = self._graph_snapshot()
         seq = _current_query_seq(self._session_db_path, request.scope)
         now_ts = time.time()
         source_db = (
@@ -516,6 +517,7 @@ class AkashaMemoryEngine:
                 fan=fan,
                 source_cursor=source_cursor,
                 edges_by_src=edges_by_src,
+                edges_meta=edges_meta,
                 soft_recall=False,
                 return_limit=self._akasha_config.activate_limit,
             )
@@ -533,6 +535,7 @@ class AkashaMemoryEngine:
                 fan=fan,
                 source_cursor=source_cursor,
                 edges_by_src=edges_by_src,
+                edges_meta=edges_meta,
                 soft_recall=True,
                 return_limit=display_limit,
                 graph_seed_keys=graph_seed_keys,
@@ -643,7 +646,7 @@ class AkashaMemoryEngine:
     # 启动时加载一次内存图。
     def _load_graph_cache(self) -> None:
         nodes = {node.key: node for node in self._store.list_nodes()}
-        edges = self._store.load_edges()
+        edges, edges_meta = self._store.load_edges_with_meta()
         message_embeddings = dict(
             self._store.list_cached_embeddings(model=self._config.memory.embedding.model)
         )
@@ -651,6 +654,7 @@ class AkashaMemoryEngine:
         with self._graph_lock:
             self._nodes = nodes
             self._edges = edges
+            self._edges_meta = edges_meta
             self._edges_by_src = _edges_by_src(edges)
             self._fan = _fan_counts(edges)
             self._message_embeddings = message_embeddings
@@ -663,6 +667,7 @@ class AkashaMemoryEngine:
         dict[str, AkashaNode],
         dict[str, int],
         dict[str, dict[str, float]],
+        dict[tuple[str, str], float],
         dict[str, np.ndarray],
         dict[str, str],
     ]:
@@ -670,6 +675,7 @@ class AkashaMemoryEngine:
             self._graph_lock = threading.RLock()
             self._nodes = {}
             self._edges = {}
+            self._edges_meta = {}
             self._edges_by_src = {}
             self._fan = {}
             self._message_embeddings = {}
@@ -680,6 +686,7 @@ class AkashaMemoryEngine:
                 dict(self._nodes),
                 dict(self._fan),
                 self._edges_by_src,
+                dict(self._edges_meta),
                 dict(self._message_embeddings),
                 dict(self._message_turn_keys),
             )
@@ -735,9 +742,14 @@ class AkashaMemoryEngine:
                 if old is None:
                     weight = 0.12 * item.strength
                 else:
-                    decayed = old * 0.9995
+                    decayed = _effective_edge_weight(
+                        old,
+                        self._edges_meta.get(edge_key, 0.0),
+                        item.ts,
+                    )
                     weight = _bounded_add(decayed, 0.12 * item.strength, 2.0)
                 self._edges[edge_key] = weight
+                self._edges_meta[edge_key] = item.ts
                 self._edges_by_src.setdefault(item.src_key, {})[item.dst_key] = weight
             self._fan = _fan_counts(self._edges)
 
@@ -752,6 +764,11 @@ class AkashaMemoryEngine:
             self._edges = {
                 key: weight
                 for key, weight in self._edges.items()
+                if key[0] not in remove_ids and key[1] not in remove_ids
+            }
+            self._edges_meta = {
+                key: value
+                for key, value in self._edges_meta.items()
                 if key[0] not in remove_ids and key[1] not in remove_ids
             }
             self._edges_by_src = _edges_by_src(self._edges)
@@ -987,6 +1004,7 @@ def _compute_candidates(
     fan: dict[str, int],
     source_cursor: sqlite3.Cursor | None = None,
     edges_by_src: dict[str, dict[str, float]] | None = None,
+    edges_meta: dict[tuple[str, str], float] | None = None,
     soft_recall: bool = False,
     return_limit: int | None = None,
     graph_seed_keys: list[str] | None = None,
@@ -1001,6 +1019,7 @@ def _compute_candidates(
         fan=fan,
         source_cursor=source_cursor,
         edges_by_src=edges_by_src,
+        edges_meta=edges_meta,
         soft_recall=soft_recall,
         return_limit=return_limit,
         graph_seed_keys=graph_seed_keys,
