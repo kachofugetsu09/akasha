@@ -10,15 +10,18 @@ import numpy as np
 from plugins.akasha.config import AkashaConfig
 from plugins.akasha.core import (
     ActivationEventRow,
+    AkashaActivationSnapshot,
     AkashaCandidate,
     CoreConfig,
     EdgeUpdate,
     SourceMessage,
     activation_updates,
-    compute_candidates,
+    compute_candidates_from_snapshot,
     edges_by_src,
     fan_counts,
+    graph_seed_keys_from_snapshot,
     parse_ts_unix,
+    turn_key,
 )
 from plugins.akasha.store import AkashaStore
 
@@ -42,11 +45,15 @@ class AkashaReplayRuntime:
         store: AkashaStore,
         config: AkashaConfig,
         source_cursor: sqlite3.Cursor,
+        message_embeddings: dict[str, np.ndarray],
+        message_turn_keys: dict[str, str],
     ) -> None:
         self._store = store
         self._config = config
         self._core_config = _core_config(config)
         self._source_cursor = source_cursor
+        self._message_embeddings = dict(message_embeddings)
+        self._message_turn_keys = dict(message_turn_keys)
 
     # 按线上状态机回放一轮：先激活旧图，再提交当前 turn。
     def replay_turn(
@@ -80,20 +87,32 @@ class AkashaReplayRuntime:
             return []
 
         edges, edges_meta = self._store.load_edges_with_meta()
+        query_vec = np.array(embedding, dtype=np.float32)
+        snapshot = AkashaActivationSnapshot(
+            nodes=nodes,
+            edges=edges,
+            edges_meta=edges_meta,
+            fan=fan_counts(edges),
+            edges_by_src=edges_by_src(edges),
+            message_embeddings=self._message_embeddings,
+            message_turn_keys=self._message_turn_keys,
+        )
+        graph_seed_keys = graph_seed_keys_from_snapshot(
+            query_vec,
+            snapshot,
+            limit=self._config.dense_top_k,
+        )
         now_ts = parse_ts_unix(message.ts)
-        candidates, _, _ = compute_candidates(
+        candidates, _, _ = compute_candidates_from_snapshot(
             message.content,
-            np.array(embedding, dtype=np.float32),
-            nodes,
-            edges,
+            query_vec,
+            snapshot,
             now_ts,
             config=self._core_config,
-            fan=fan_counts(edges),
             source_cursor=self._source_cursor,
-            edges_by_src=edges_by_src(edges),
-            edges_meta=edges_meta,
             soft_recall=False,
             return_limit=self._config.activate_limit,
+            graph_seed_keys=graph_seed_keys,
         )
         self._store.update_activation_batch(activation_updates(candidates, nodes, now_ts))
         return candidates
@@ -107,6 +126,12 @@ class AkashaReplayRuntime:
         current_key = ""
         for item in items:
             current_key = self._store.upsert_message_node(item.message, item.embedding)
+            self._message_embeddings[item.message.id] = np.array(item.embedding, dtype=np.float32)
+            self._message_turn_keys[item.message.id] = turn_key(
+                item.message.session_key,
+                item.message.seq,
+                item.message.role,
+            )[2]
         if current_key and activation_items:
             trigger = next((item.message for item in items if item.message.role == "user"), items[0].message)
             ts = parse_ts_unix(trigger.ts)

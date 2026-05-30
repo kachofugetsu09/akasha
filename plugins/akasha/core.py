@@ -10,7 +10,6 @@ from __future__ import annotations
 import math
 import struct
 import sqlite3
-import time
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -29,6 +28,7 @@ STRENGTH_CAP = 3.0
 # initial_strength = STRENGTH_CAP × (BASE + SALIENCE_BONUS · σ)
 INITIAL_STRENGTH_BASE = 0.70
 INITIAL_STRENGTH_SALIENCE_BONUS = 0.30
+SALIENCE_CENTROID_SCALE = 2.0
 
 
 def initial_strength(salience: float) -> float:
@@ -253,6 +253,17 @@ class ActivationTrace:
 
 
 @dataclass(frozen=True)
+class AkashaActivationSnapshot:
+    nodes: dict[str, AkashaNode]
+    edges: dict[tuple[str, str], float]
+    edges_meta: dict[tuple[str, str], float]
+    fan: dict[str, int]
+    edges_by_src: dict[str, dict[str, float]]
+    message_embeddings: dict[str, np.ndarray]
+    message_turn_keys: dict[str, str]
+
+
+@dataclass(frozen=True)
 class EdgeUpdate:
     src_key: str
     dst_key: str
@@ -282,6 +293,30 @@ def normalize(vector: np.ndarray) -> np.ndarray:
     """归一化向量到单位长度。"""
     norm = float(np.linalg.norm(vector))
     return vector / norm if norm > 0 else vector
+
+
+def causal_salience(
+    embedding: list[float] | np.ndarray,
+    prior_sum: np.ndarray | None,
+    prior_count: int,
+) -> float:
+    """只用当前消息之前的全局重心计算 salience。"""
+    if prior_sum is None or prior_count <= 0:
+        return 0.0
+    vector = normalize(np.array(embedding, dtype=np.float32))
+    centroid = normalize(prior_sum / float(prior_count))
+    value = (1.0 - float(np.dot(vector, centroid))) * SALIENCE_CENTROID_SCALE
+    return min(1.0, max(0.0, value))
+
+
+def advance_salience_state(
+    prior_sum: np.ndarray | None,
+    prior_count: int,
+    embedding: list[float] | np.ndarray,
+) -> tuple[np.ndarray, int]:
+    vector = normalize(np.array(embedding, dtype=np.float32))
+    total = vector.copy() if prior_sum is None else prior_sum + vector
+    return total, prior_count + 1
 
 
 def _best_device() -> str:
@@ -330,8 +365,8 @@ def parse_ts_unix(value: str) -> float:
     """把时间字符串转换成 Unix 秒。"""
     try:
         return datetime.fromisoformat(value).timestamp()
-    except Exception:
-        return time.time()
+    except ValueError as exc:
+        raise ValueError(f"无效时间戳: {value}") from exc
 
 
 def message_id_to_key_from_db(cursor: sqlite3.Cursor, message_id: str) -> str:
@@ -564,6 +599,26 @@ def dense_message_candidates(
         if len(candidates) >= limit:
             break
     return candidates
+
+
+def graph_seed_keys_from_snapshot(
+    query_vec: np.ndarray,
+    snapshot: AkashaActivationSnapshot,
+    *,
+    limit: int,
+) -> list[str]:
+    if not snapshot.message_embeddings:
+        return []
+    return [
+        item.key
+        for item in dense_message_candidates(
+            query_vec,
+            snapshot.nodes,
+            snapshot.message_embeddings,
+            snapshot.message_turn_keys,
+            limit=limit,
+        )
+    ]
 
 
 # ── Seed 选择 ─────────────────────────────────────────────────────────
@@ -1173,6 +1228,35 @@ def compute_candidates(
         suppressed = [item for item in suppressed if item.key not in active_keys]
     return candidates, suppressed, ActivationTrace(
         seed_count=len(seed_sources), pool_count=len(valid_keys),
+    )
+
+
+def compute_candidates_from_snapshot(
+    query: str,
+    query_vec: np.ndarray,
+    snapshot: AkashaActivationSnapshot,
+    now_ts: float,
+    *,
+    config: CoreConfig,
+    source_cursor: sqlite3.Cursor | None = None,
+    soft_recall: bool = False,
+    return_limit: int | None = None,
+    graph_seed_keys: list[str] | None = None,
+) -> tuple[list[AkashaCandidate], list[AkashaCandidate], ActivationTrace]:
+    return compute_candidates(
+        query,
+        query_vec,
+        snapshot.nodes,
+        snapshot.edges,
+        now_ts,
+        config=config,
+        fan=snapshot.fan,
+        source_cursor=source_cursor,
+        edges_by_src=snapshot.edges_by_src,
+        edges_meta=snapshot.edges_meta,
+        soft_recall=soft_recall,
+        return_limit=return_limit,
+        graph_seed_keys=graph_seed_keys,
     )
 
 

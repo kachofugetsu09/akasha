@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import threading
+from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,28 +19,55 @@ if not HOST_ROOT.exists():
 sys.path.append(str(HOST_ROOT))
 
 import plugins.akasha.core as core
-import plugins.akasha.engine as engine_module
 from core.memory.engine import MemoryQuery, MemoryScope
 from plugins.akasha.config import AkashaConfig
 from plugins.akasha.engine import AkashaMemoryEngine
-from plugins.akasha.replay import AkashaReplayRuntime
+from plugins.akasha.replay import AkashaReplayRuntime, ReplayMessage
 from plugins.akasha.store import AkashaStore
 
 
 T0 = 1_700_000_000.0
 NOW = T0 + 86_400.0
+T0_ISO = datetime.fromtimestamp(T0, timezone.utc).isoformat()
+NOW_ISO = datetime.fromtimestamp(NOW, timezone.utc).isoformat()
+
+
+def _init_sessions_db(path: Path) -> None:
+    with closing(sqlite3.connect(str(path))) as db:
+        db.execute(
+            """
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                ts TEXT NOT NULL
+            )
+            """
+        )
+        db.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("m0", "s", 0, "user", "alpha", T0_ISO),
+                ("m2", "s", 2, "user", "beta", T0_ISO),
+            ],
+        )
+        db.execute("CREATE VIRTUAL TABLE messages_fts USING fts5(content)")
+        db.execute("INSERT INTO messages_fts(rowid, content) VALUES (1, 'alpha')")
+        db.execute("INSERT INTO messages_fts(rowid, content) VALUES (2, 'beta')")
+        db.commit()
 
 
 def _seed_store(path: Path) -> AkashaStore:
     store = AkashaStore(path)
-    store.upsert_message_node(
-        core.SourceMessage("m0", "s", 0, "user", "alpha", str(T0), 0.0),
-        [1.0, 0.0],
-    )
-    store.upsert_message_node(
-        core.SourceMessage("m2", "s", 2, "user", "beta", str(T0), 0.0),
-        [0.98, 0.02],
-    )
+    messages = [
+        (core.SourceMessage("m0", "s", 0, "user", "alpha", T0_ISO, 0.0), [1.0, 0.0]),
+        (core.SourceMessage("m2", "s", 2, "user", "beta", T0_ISO, 0.0), [0.98, 0.02]),
+    ]
+    for message, embedding in messages:
+        store.upsert_cached_embedding(message=message, model="m", embedding=embedding)
+        store.upsert_message_node(message, embedding)
     store.upsert_edges([
         core.EdgeUpdate("s:0", "s:2", 1.0, T0),
         core.EdgeUpdate("s:2", "s:0", 1.0, T0),
@@ -48,7 +78,7 @@ def _seed_store(path: Path) -> AkashaStore:
 def _runtime_engine(store: AkashaStore, workspace: Path) -> Any:
     engine = cast(Any, AkashaMemoryEngine.__new__(AkashaMemoryEngine))
     engine._store = store
-    engine._session_db_path = workspace / "missing-sessions.db"
+    engine._session_db_path = workspace / "sessions.db"
     engine._akasha_config = AkashaConfig(dense_seed_threshold=0.1, nearby_dense_threshold=0.0)
     engine._config = SimpleNamespace(
         memory=SimpleNamespace(embedding=SimpleNamespace(model="m"))
@@ -65,6 +95,14 @@ def _runtime_engine(store: AkashaStore, workspace: Path) -> Any:
     return engine
 
 
+def _message_embeddings(store: AkashaStore) -> dict[str, np.ndarray]:
+    return dict(store.list_cached_embeddings(model="m"))
+
+
+def _message_turn_keys() -> dict[str, str]:
+    return {"m0": "s:0", "m2": "s:2"}
+
+
 def _shape(items: list[core.AkashaCandidate]) -> list[tuple[str, str, str]]:
     return [
         (item.key, item.source, item.path_type)
@@ -76,10 +114,22 @@ def _scores(items: list[core.AkashaCandidate]) -> list[float]:
     return [item.score for item in items]
 
 
+def _node_salience(store: AkashaStore, key: str) -> float:
+    node = store.get_node(key)
+    assert node is not None
+    return node.salience
+
+
+def test_parse_ts_unix_rejects_non_iso_timestamp() -> None:
+    with pytest.raises(ValueError):
+        core.parse_ts_unix(str(T0))
+
+
 def test_runtime_and_replay_use_same_decayed_edges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _init_sessions_db(tmp_path / "sessions.db")
     runtime_store = _seed_store(tmp_path / "runtime.db")
     replay_store = _seed_store(tmp_path / "replay.db")
     calls = {"runtime": 0, "replay": 0}
@@ -91,12 +141,17 @@ def test_runtime_and_replay_use_same_decayed_edges(
             return original(weight, last_used_ts, now_ts)
 
         monkeypatch.setattr(core, "effective_edge_weight", counted_runtime)
-        monkeypatch.setattr(engine_module.time, "time", lambda: NOW)
         engine = _runtime_engine(runtime_store, tmp_path)
         runtime_result = engine._retrieve(
             "alpha",
             np.array([1.0, 0.0], dtype=np.float32),
-            MemoryQuery(text="alpha", intent="answer", scope=MemoryScope(session_key="s")),
+            MemoryQuery(
+                text="alpha",
+                intent="answer",
+                scope=MemoryScope(session_key="s"),
+                timestamp=datetime.fromtimestamp(NOW, timezone.utc),
+            ),
+            now_ts=NOW,
         )
 
         def counted_replay(weight: float, last_used_ts: float, now_ts: float) -> float:
@@ -104,15 +159,18 @@ def test_runtime_and_replay_use_same_decayed_edges(
             return original(weight, last_used_ts, now_ts)
 
         monkeypatch.setattr(core, "effective_edge_weight", counted_replay)
-        replay = AkashaReplayRuntime(
-            store=replay_store,
-            config=AkashaConfig(dense_seed_threshold=0.1, nearby_dense_threshold=0.0),
-            source_cursor=None,
-        )
-        replay_items = replay.activate_before_turn(
-            core.SourceMessage("m4", "s", 4, "user", "alpha", str(NOW), 0.0),
-            [1.0, 0.0],
-        )
+        with closing(sqlite3.connect(str(tmp_path / "sessions.db"))) as source_db:
+            replay = AkashaReplayRuntime(
+                store=replay_store,
+                config=AkashaConfig(dense_seed_threshold=0.1, nearby_dense_threshold=0.0),
+                source_cursor=source_db.cursor(),
+                message_embeddings=_message_embeddings(replay_store),
+                message_turn_keys=_message_turn_keys(),
+            )
+            replay_items = replay.activate_before_turn(
+                core.SourceMessage("m4", "s", 4, "user", "alpha", NOW_ISO, 0.0),
+                [1.0, 0.0],
+            )
     finally:
         runtime_store.close()
         replay_store.close()
@@ -124,6 +182,7 @@ def test_runtime_and_replay_use_same_decayed_edges(
 
 
 def test_store_and_runtime_cache_apply_same_edge_decay(tmp_path: Path) -> None:
+    _init_sessions_db(tmp_path / "sessions.db")
     store = _seed_store(tmp_path / "akasha.db")
     engine = _runtime_engine(store, tmp_path)
     update = core.EdgeUpdate("s:0", "s:2", 0.5, NOW)
@@ -139,3 +198,67 @@ def test_store_and_runtime_cache_apply_same_edge_decay(tmp_path: Path) -> None:
         persisted_edges[("s:0", "s:2")]
     )
     assert engine._edges_meta[("s:0", "s:2")] == persisted_meta[("s:0", "s:2")]
+
+
+def test_store_persists_causal_salience_state(tmp_path: Path) -> None:
+    store = AkashaStore(tmp_path / "akasha.db")
+    try:
+        store.upsert_message_node(
+            core.SourceMessage("m10", "s", 10, "user", "first", T0_ISO),
+            [1.0, 0.0],
+        )
+        store.upsert_message_node(
+            core.SourceMessage("m12", "s", 12, "user", "second", T0_ISO),
+            [0.0, 1.0],
+        )
+    finally:
+        store.close()
+
+    store = AkashaStore(tmp_path / "akasha.db")
+    try:
+        store.upsert_message_node(
+            core.SourceMessage("m14", "s", 14, "user", "third", T0_ISO),
+            [1.0, 0.0],
+        )
+        assert _node_salience(store, "s:10") == pytest.approx(0.0)
+        assert _node_salience(store, "s:12") == pytest.approx(1.0)
+        assert _node_salience(store, "s:14") == pytest.approx(0.585786, abs=1e-6)
+    finally:
+        store.close()
+
+
+def test_replay_and_online_write_same_causal_salience(tmp_path: Path) -> None:
+    _init_sessions_db(tmp_path / "sessions.db")
+    online_store = AkashaStore(tmp_path / "online.db")
+    replay_store = AkashaStore(tmp_path / "replay.db")
+    messages = [
+        (core.SourceMessage("m10", "s", 10, "user", "first", T0_ISO), [1.0, 0.0]),
+        (core.SourceMessage("m12", "s", 12, "user", "second", T0_ISO), [0.0, 1.0]),
+        (core.SourceMessage("m14", "s", 14, "user", "third", T0_ISO), [1.0, 0.0]),
+    ]
+    try:
+        for message, embedding in messages:
+            online_store.upsert_message_node(message, embedding)
+        with closing(sqlite3.connect(str(tmp_path / "sessions.db"))) as source_db:
+            replay = AkashaReplayRuntime(
+                store=replay_store,
+                config=AkashaConfig(),
+                source_cursor=source_db.cursor(),
+                message_embeddings={},
+                message_turn_keys={},
+            )
+            for message, embedding in messages:
+                _ = replay.commit_turn([ReplayMessage(message=message, embedding=embedding)], [])
+
+        assert _node_salience(online_store, "s:10") == pytest.approx(
+            _node_salience(replay_store, "s:10")
+        )
+        assert _node_salience(online_store, "s:12") == pytest.approx(
+            _node_salience(replay_store, "s:12")
+        )
+        assert _node_salience(online_store, "s:14") == pytest.approx(
+            _node_salience(replay_store, "s:14")
+        )
+    finally:
+        online_store.close()
+        replay_store.close()

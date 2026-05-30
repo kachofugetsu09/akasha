@@ -12,7 +12,9 @@ import numpy as np
 from plugins.akasha.core import (
     AkashaNode, ActivationUpdate, EdgeUpdate, ActivationEventRow,
     SourceMessage, turn_key, serialize_f32, deserialize_f32, parse_ts_unix,
+    advance_salience_state,
     bounded_add,
+    causal_salience,
     effective_edge_weight,
     initial_strength,
     normalize as _normalize,
@@ -103,6 +105,12 @@ CREATE TABLE IF NOT EXISTS akasha_embedding_cache (
 );
 CREATE INDEX IF NOT EXISTS ix_akasha_embedding_cache_hash
     ON akasha_embedding_cache (content_hash, model);
+CREATE TABLE IF NOT EXISTS akasha_salience_state (
+    key         TEXT PRIMARY KEY,
+    vector_sum BLOB NOT NULL,
+    count       INTEGER NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS akasha_migration_runs (
     id               TEXT PRIMARY KEY,
     source_db_path   TEXT NOT NULL,
@@ -131,6 +139,7 @@ DROP TABLE IF EXISTS akasha_query_log;
 DROP TABLE IF EXISTS akasha_activation_events;
 DROP TABLE IF EXISTS akasha_edges;
 DROP TABLE IF EXISTS akasha_nodes;
+DROP TABLE IF EXISTS akasha_salience_state;
 """
 
 
@@ -395,15 +404,17 @@ class AkashaStore:
         )
         vector = _normalize(np.array(embedding, dtype=np.float32))
         ts_unix = parse_ts_unix(message.ts)
-        salience = (
-            0.0
-            if message.salience is None
-            else min(1.0, max(0.0, float(message.salience)))
-        )
         now = _now_iso()
 
         # 2. 新 turn 直接写入；已有 turn 用均值更新 embedding，并保留 user 作为 anchor。
         with self._lock:
+            prior_sum, prior_count = self._load_salience_state_locked()
+            salience = (
+                causal_salience(vector, prior_sum, prior_count)
+                if message.salience is None
+                else min(1.0, max(0.0, float(message.salience)))
+            )
+            next_sum, next_count = advance_salience_state(prior_sum, prior_count, vector)
             row = self._db.execute(
                 "SELECT * FROM akasha_nodes WHERE key = ?",
                 (key,),
@@ -438,6 +449,7 @@ class AkashaStore:
                         now,
                     ),
                 )
+                self._write_salience_state_locked(next_sum, next_count, now)
                 self._db.commit()
                 return key
 
@@ -464,8 +476,37 @@ class AkashaStore:
                     key,
                 ),
             )
+            self._write_salience_state_locked(next_sum, next_count, now)
             self._db.commit()
         return key
+
+    def _load_salience_state_locked(self) -> tuple[np.ndarray | None, int]:
+        row = self._db.execute(
+            "SELECT vector_sum, count FROM akasha_salience_state WHERE key = 'global'"
+        ).fetchone()
+        if row is None:
+            return None, 0
+        vector_sum = deserialize_f32(row["vector_sum"])
+        count = int(row["count"] or 0)
+        return (vector_sum if vector_sum.size else None), count
+
+    def _write_salience_state_locked(
+        self,
+        vector_sum: np.ndarray,
+        count: int,
+        now: str,
+    ) -> None:
+        _ = self._db.execute(
+            """
+            INSERT INTO akasha_salience_state (key, vector_sum, count, updated_at)
+            VALUES ('global', ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                vector_sum = excluded.vector_sum,
+                count = excluded.count,
+                updated_at = excluded.updated_at
+            """,
+            (serialize_f32(vector_sum), count, now),
+        )
 
     # 读取全部 turn 节点。
     def list_nodes(self) -> list[AkashaNode]:

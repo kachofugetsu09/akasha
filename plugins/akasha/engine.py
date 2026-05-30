@@ -12,10 +12,9 @@ import hashlib
 import math
 import sqlite3
 import threading
-import time
 from contextlib import closing
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -25,6 +24,7 @@ from plugins.akasha.core import (
     # Types shared with core
     ActivationEventRow,
     ActivationTrace,
+    AkashaActivationSnapshot,
     ActivationUpdate,
     AkashaCandidate,
     AkashaNode,
@@ -35,10 +35,12 @@ from plugins.akasha.core import (
     # Algorithm functions (aliased with _ prefix for internal convention)
     activation_updates as _activation_updates,
     compute_candidates as _core_compute_candidates,
+    compute_candidates_from_snapshot as _core_compute_candidates_from_snapshot,
     dense_message_candidates as _dense_message_candidates,
     edges_by_src as _edges_by_src,
     effective_edge_weight as _effective_edge_weight,
     fan_counts as _fan_counts,
+    graph_seed_keys_from_snapshot as _graph_seed_keys_from_snapshot,
     parse_turn_key as _parse_turn_key,
     bounded_add as _bounded_add,
 )
@@ -240,10 +242,19 @@ class AkashaMemoryEngine:
             return MemoryQueryResult(trace={"engine": self.DESCRIPTOR.name, "hit_count": 0})
 
         # 3. 检索旧 turn 图，并在 context 入口记录本轮激活。
+        now_ts = _query_timestamp_unix(request)
+        if now_ts is None:
+            return MemoryQueryResult(
+                trace={
+                    "engine": self.DESCRIPTOR.name,
+                    "intent": request.intent,
+                    "error": "missing_query_timestamp",
+                }
+            )
         query_vec = np.array(await self._embedder.embed(query_text), dtype=np.float32)
-        result = self._retrieve(query_text, query_vec, request)
+        result = self._retrieve(query_text, query_vec, request, now_ts=now_ts)
         if request.intent in {"context", "answer"}:
-            self._remember_pending_activation(request, result.activation_items)
+            self._remember_pending_activation(request, result.activation_items, now_ts=now_ts)
 
         # 4. context 注入按 Akasha 配置展示 topK；工具查询继续尊重调用方 limit。
         dense_limit = self._akasha_config.dense_top_k
@@ -485,11 +496,12 @@ class AkashaMemoryEngine:
         query: str,
         query_vec: np.ndarray,
         request: MemoryQuery,
+        *,
+        now_ts: float,
     ) -> "_AkashaRetrieval":
         # 1. 准备内存图和当前查询所在的预测 seq。
-        nodes, fan, edges_by_src, edges_meta, message_embeddings, message_turn_keys = self._graph_snapshot()
+        snapshot = self._graph_snapshot()
         seq = _current_query_seq(self._session_db_path, request.scope)
-        now_ts = time.time()
         source_db = (
             sqlite3.connect(str(self._session_db_path))
             if self._session_db_path.exists()
@@ -501,41 +513,38 @@ class AkashaMemoryEngine:
             source_cursor = source_db.cursor() if source_db is not None else None
             dense_items = _dense_message_candidates(
                 query_vec,
-                nodes,
-                message_embeddings,
-                message_turn_keys,
+                snapshot.nodes,
+                snapshot.message_embeddings,
+                snapshot.message_turn_keys,
                 limit=max(self._akasha_config.dense_top_k, request.limit),
             )
-            graph_seed_keys = [item.key for item in dense_items[:self._akasha_config.dense_top_k]]
-            activation_items, _, _ = _compute_candidates(
+            graph_seed_keys = _graph_seed_keys_from_snapshot(
+                query_vec,
+                snapshot,
+                limit=self._akasha_config.dense_top_k,
+            )
+            activation_items, _, _ = _compute_candidates_from_snapshot(
                 query,
                 query_vec,
-                nodes,
-                {},
                 now_ts,
+                snapshot=snapshot,
                 config=self._akasha_config,
-                fan=fan,
                 source_cursor=source_cursor,
-                edges_by_src=edges_by_src,
-                edges_meta=edges_meta,
                 soft_recall=False,
                 return_limit=self._akasha_config.activate_limit,
+                graph_seed_keys=graph_seed_keys,
             )
             display_limit = max(
                 24,
                 max(self._akasha_config.ripple_top_k, request.limit) * 3,
             )
-            ripple_items, _, trace = _compute_candidates(
+            ripple_items, _, trace = _compute_candidates_from_snapshot(
                 query,
                 query_vec,
-                nodes,
-                {},
                 now_ts,
+                snapshot=snapshot,
                 config=self._akasha_config,
-                fan=fan,
                 source_cursor=source_cursor,
-                edges_by_src=edges_by_src,
-                edges_meta=edges_meta,
                 soft_recall=True,
                 return_limit=display_limit,
                 graph_seed_keys=graph_seed_keys,
@@ -545,7 +554,7 @@ class AkashaMemoryEngine:
                 source_db.close()
 
         # 3. 查询阶段只更新旧节点状态，当前 turn 的边等 after-turn 再补。
-        updates = _activation_updates(activation_items, nodes, now_ts)
+        updates = _activation_updates(activation_items, snapshot.nodes, now_ts)
         self._store.update_activation_batch(updates)
         self._apply_activation_updates(updates)
         return _AkashaRetrieval(
@@ -561,6 +570,8 @@ class AkashaMemoryEngine:
         self,
         request: MemoryQuery,
         items: list[AkashaCandidate],
+        *,
+        now_ts: float,
     ) -> None:
         # 1. 没有 session_key 时仍可检索，但不建当前 turn 的共激活边。
         if not request.scope.session_key or not items:
@@ -569,7 +580,7 @@ class AkashaMemoryEngine:
         self._pending_by_session[request.scope.session_key] = PendingActivation(
             query_id=f"{request.scope.session_key}:{seq}",
             seq=seq,
-            ts=time.time(),
+            ts=now_ts,
             items=list(items),
         )
 
@@ -661,16 +672,7 @@ class AkashaMemoryEngine:
             self._message_turn_keys = message_turn_keys
 
     # 取查询使用的内存图快照。
-    def _graph_snapshot(
-        self,
-    ) -> tuple[
-        dict[str, AkashaNode],
-        dict[str, int],
-        dict[str, dict[str, float]],
-        dict[tuple[str, str], float],
-        dict[str, np.ndarray],
-        dict[str, str],
-    ]:
+    def _graph_snapshot(self) -> AkashaActivationSnapshot:
         if not hasattr(self, "_graph_lock"):
             self._graph_lock = threading.RLock()
             self._nodes = {}
@@ -682,13 +684,17 @@ class AkashaMemoryEngine:
             self._message_turn_keys = {}
             self._load_graph_cache()
         with self._graph_lock:
-            return (
-                dict(self._nodes),
-                dict(self._fan),
-                self._edges_by_src,
-                dict(self._edges_meta),
-                dict(self._message_embeddings),
-                dict(self._message_turn_keys),
+            return AkashaActivationSnapshot(
+                nodes=dict(self._nodes),
+                edges=dict(self._edges),
+                edges_meta=dict(self._edges_meta),
+                fan=dict(self._fan),
+                edges_by_src={
+                    key: dict(value)
+                    for key, value in self._edges_by_src.items()
+                },
+                message_embeddings=dict(self._message_embeddings),
+                message_turn_keys=dict(self._message_turn_keys),
             )
 
     # 把查询产生的状态更新同步进内存图。
@@ -925,14 +931,13 @@ class AkashaMemoryEngine:
         store = getattr(self, "_store", None)
         if store is None:
             return
-        from datetime import datetime, timezone
         store.insert_query_log(
             query_id=_query_log_id(request.scope.session_key or "", seq, request.intent, request.text),
             session_key=request.scope.session_key or "",
             seq=seq,
             query_text=request.text.strip(),
             intent=request.intent,
-            ts=datetime.now(timezone.utc).isoformat(),
+            ts=datetime.fromtimestamp(_query_timestamp_unix(request) or 0.0, timezone.utc).isoformat(),
             seed_count=result.trace.seed_count,
             pool_count=result.trace.pool_count,
             activated_count=len(result.activation_items),
@@ -1026,7 +1031,38 @@ def _compute_candidates(
     )
 
 
+def _compute_candidates_from_snapshot(
+    query: str,
+    query_vec: np.ndarray,
+    now_ts: float,
+    *,
+    snapshot: AkashaActivationSnapshot,
+    config: AkashaConfig,
+    source_cursor: sqlite3.Cursor | None = None,
+    soft_recall: bool = False,
+    return_limit: int | None = None,
+    graph_seed_keys: list[str] | None = None,
+) -> tuple[list[AkashaCandidate], list[AkashaCandidate], ActivationTrace]:
+    return _core_compute_candidates_from_snapshot(
+        query,
+        query_vec,
+        snapshot,
+        now_ts,
+        config=_core_config(config),
+        source_cursor=source_cursor,
+        soft_recall=soft_recall,
+        return_limit=return_limit,
+        graph_seed_keys=graph_seed_keys,
+    )
+
+
 # ── sessions.db 特有辅助函数 ──────────────────────────────────────────
+
+
+def _query_timestamp_unix(request: MemoryQuery) -> float | None:
+    if request.timestamp is None:
+        return None
+    return float(request.timestamp.timestamp())
 
 
 # 读取 message 到 turn key 的映射。
