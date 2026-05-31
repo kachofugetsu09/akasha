@@ -1,0 +1,8 @@
+# 私有：内部研究笔记、真实数据实验（含个人对话/嵌入），不外推
+private/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
