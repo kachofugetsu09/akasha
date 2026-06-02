@@ -6,3 +6,9 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+# Added by CJADK
+.cjadk/
+# Added by CJADK
+log/app.log
+# Added by CJADK
+.claude/skills/
