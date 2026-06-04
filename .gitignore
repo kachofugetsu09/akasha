@@ -10,5 +10,4 @@ __pycache__/
 .cjadk/
 # Added by CJADK
 log/app.log
-# Added by CJADK
-.claude/skills/
+
