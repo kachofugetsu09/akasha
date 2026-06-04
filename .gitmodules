@@ -1,0 +1,3 @@
+[submodule "bench"]
+	path = bench
+	url = git@github.com:kachofugetsu09/akasha-bench.git
