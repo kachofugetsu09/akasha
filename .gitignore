@@ -5,6 +5,7 @@ private/
 __pycache__/
 *.pyc
 .venv/
+.bench-venv/
 .pytest_cache/
 # Added by CJADK
 .cjadk/
