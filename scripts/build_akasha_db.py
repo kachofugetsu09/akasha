@@ -19,7 +19,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from agent.config_models import Config
 from plugins.akasha.config import (
     AkashaConfig,
     load_akasha_config,
@@ -62,6 +61,11 @@ def _parse_args() -> argparse.Namespace:
     _ = parser.add_argument("--sessions-db", default="", help="原始 sessions.db 路径")
     _ = parser.add_argument("--db-path", default="", help="输出 akasha.db 路径")
     _ = parser.add_argument("--progress-every", type=int, default=500, help="进度打印间隔")
+    _ = parser.add_argument(
+        "--embedding-model",
+        default="",
+        help="直接指定 embedding 模型名（缓存命中键用）；给定后不读 --config，免依赖 agent 包",
+    )
     return parser.parse_args()
 
 
@@ -233,8 +237,12 @@ def _run() -> MigrationStats:
     # 2. 备份旧 sidecar，并初始化本次迁移记录。
     backup_path = _backup_existing_db(db_path)
     store = AkashaStore(db_path)
-    config = Config.load(str(args.config))
-    embedding_model = config.memory.embedding.model
+    if str(args.embedding_model).strip():
+        embedding_model = str(args.embedding_model).strip()
+    else:
+        from agent.config_models import Config  # 惰性导入：仅在需要读 config 时才依赖 agent 包
+        config = Config.load(str(args.config))
+        embedding_model = config.memory.embedding.model
     run_id = store.start_migration_run(
         source_db_path=sessions_db,
         embedding_model=embedding_model,

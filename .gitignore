@@ -12,3 +12,4 @@ __pycache__/
 # Added by CJADK
 log/app.log
 
+.exp/
