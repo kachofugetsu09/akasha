@@ -306,6 +306,7 @@ def test_runtime_and_replay_use_same_decayed_edges(
                 timestamp=datetime.fromtimestamp(NOW, timezone.utc),
             ),
             now_ts=NOW,
+            update_state=True,
         )
 
         def counted_replay(weight: float, last_used_ts: float, now_ts: float) -> float:
