@@ -1,6 +1,12 @@
 # 私有：内部研究笔记、真实数据实验（含个人对话/嵌入），不外推
 private/
 
+# 本地研究报告和重建证据，真实对话/数据库只进 private bench
+.codex-backups/
+docs/akasha-*.md
+docs/figures/
+skills-lock.json
+
 # Python
 __pycache__/
 *.pyc
