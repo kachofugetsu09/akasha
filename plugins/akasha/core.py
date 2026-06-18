@@ -121,7 +121,6 @@ FAN_PENALTY_POWER = 0.10
 ACTIVATION_THRESHOLD = 0.22
 GRAPH_EXPAND_LIMIT = 8
 GRAPH_DIRECT_BIAS = 0.25
-GRAPH_FAN_PENALTY_POWER = 0.15
 
 # RWR 重启概率 α：扩散迭代和 path_info 各 hop 权重都由它推出，
 # 不再是 0.2 / 0.16 / 0.64 三个独立字面量。
