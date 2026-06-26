@@ -366,21 +366,24 @@ def activation_edge_updates(
     candidates: list[AkashaCandidate],
     ts: float,
     query_residual: float = 1.0,
-    reinforced: bool = False,
+    reinforce_boost: float = 1.0,
 ) -> list[EdgeUpdate]:
     # Residual Hebb：右脑只对预测误差产生可塑性。
     # gain = max(ν_turn, REINFORCE_NU_FLOOR if reinforced else 0)
     # 完全重复输入 ν=0：本轮所有边写入权重为 0，反馈环数学上断开。
     # reinforce 重新解释：用户标记 = 给 ν 设下界，相当于一次弱新 episode 的 surprise，
     # 比普通复读厚但不超过自然 episode。
-    floor = REINFORCE_NU_FLOOR if reinforced else 0.0
+    floor = REINFORCE_NU_FLOOR if reinforce_boost > 1.0 else 0.0
     gain = max(0.0, min(1.0, max(query_residual, floor)))
-    if gain <= 0.0:
-        return []
+
     updates: list[EdgeUpdate] = []
+
+    if gain <= 0.0:
+        return updates
+
     key_to_score = {item.key: item.score for item in candidates}
     for item in candidates:
-        edge_strength = key_to_score.get(item.key, 1.0)
+        edge_strength = key_to_score.get(item.key, 1.0) * reinforce_boost
         updates.append(
             EdgeUpdate(item.key, current_key, edge_strength * STDP_CAUSAL_EDGE_GAIN * gain, ts)
         )
@@ -669,11 +672,12 @@ def decayed_strength(node: AkashaNode, now_ts: float) -> float:
 
 
 def effective_edge_weight(weight: float, last_used_ts: float, now_ts: float) -> float:
-    """边的 lazy time-decay。"""
+    """边的 lazy time-decay。引入 Late-LTP，强边保留不可逆的结构性保底。"""
     if last_used_ts <= 0:
         return weight
     gap = max(0.0, now_ts - last_used_ts)
-    return weight * math.exp(-gap / EDGE_DECAY_TAU)
+    baseline = min(0.05, weight * 0.2) if weight > 0.1 else 0.0
+    return baseline + (weight - baseline) * math.exp(-gap / EDGE_DECAY_TAU)
 
 
 def bounded_add(value: float, delta: float, cap: float) -> float:
@@ -1275,7 +1279,8 @@ def graph_expand_candidates(
             edge_signal = effective_weight / math.sqrt(max(out_strength * dst_strength, 1e-9))
             direct = max(0.0, direct_scores.get(key, 0.0))
             seed_direct = max(GRAPH_DIRECT_BIAS, max(0.0, direct_scores.get(seed_key, 0.0)))
-            candidate_signal = edge_signal * seed_direct
+            dst_salience_gain = 1.0 + nodes[key].salience
+            candidate_signal = edge_signal * seed_direct * dst_salience_gain
             scored_neighbors.append((candidate_signal, edge_signal, direct, key, effective_weight))
         scored_neighbors.sort(reverse=True, key=lambda item: item[0])
         for candidate_signal, edge_signal, direct, key, edge_weight in scored_neighbors[:GRAPH_EXPAND_LIMIT]:

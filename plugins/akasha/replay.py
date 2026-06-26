@@ -127,6 +127,7 @@ class AkashaReplayRuntime:
         self._message_turn_keys = dict(message_turn_keys)
         # turn_key -> gain_boost：来自 messages.extra["akasha_reinforce"]，重放时定向加厚该轮边。
         self._reinforce_boosts = dict(reinforce_boosts or {})
+        self._prev_activation_items: list[AkashaCandidate] = []
 
     # 按线上状态机回放一轮：先激活旧图，再提交当前 turn。
     def replay_turn(
@@ -246,21 +247,36 @@ class AkashaReplayRuntime:
             trigger = next((item.message for item in items if item.message.role == "user"), items[0].message)
             ts = parse_ts_unix(trigger.ts)
             reinforced = self._reinforce_boosts.get(current_key, 1.0) > 1.0
+            reinforce_boost = self._reinforce_boosts.get(current_key, 1.0)
             trigger_emb = next(
                 (item.embedding for item in items if item.message.role == "user"),
                 items[0].embedding,
             )
             query_residual = self._query_residual(trigger_emb, current_key)
+
+            # 认知科学：记忆再巩固 (Memory Reconsolidation) / 资格迹 (Eligibility Trace)
+            # 如果本轮是纠错（带有 reinforce），那么这个纠错是针对“上一轮”的上下文发出的。
+            # 因此，我们需要将纠错节点与上一轮检索到的上下文建立连接，把它注入到错误的局部簇中。
+            combined_activation_items = list(activation_items)
+            if reinforced and self._prev_activation_items:
+                seen_keys = {item.key for item in combined_activation_items}
+                for prev_item in self._prev_activation_items:
+                    if prev_item.key not in seen_keys:
+                        combined_activation_items.append(prev_item)
+                        seen_keys.add(prev_item.key)
+
             self._store.upsert_edges(
                 activation_edge_updates(
                     current_key,
-                    activation_items,
+                    combined_activation_items,
                     ts,
                     query_residual=query_residual,
-                    reinforced=reinforced,
+                    reinforce_boost=reinforce_boost,
                 )
             )
             self._store.insert_activation_events(_activation_events(trigger, activation_items))
+
+        self._prev_activation_items = activation_items
         return current_key
 
     # ν_turn = 1 − max_{j<i} cos(query, prior_j)²；当前 turn 自身排除。
