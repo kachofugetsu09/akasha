@@ -399,6 +399,23 @@ def activation_edge_updates(
     return updates
 
 
+def reinforced_activation_items(
+    current_items: list[AkashaCandidate],
+    previous_items: list[AkashaCandidate],
+    reinforce_boost: float,
+) -> list[AkashaCandidate]:
+    if reinforce_boost <= 1.0 or not previous_items:
+        return current_items
+    combined = list(current_items)
+    seen_keys = {item.key for item in combined}
+    for item in previous_items:
+        if item.key in seen_keys:
+            continue
+        combined.append(item)
+        seen_keys.add(item.key)
+    return combined
+
+
 def local_residual(query_vec: np.ndarray, prior_vecs: np.ndarray) -> float:
     """ν_turn = 1 − max_{j<i} cos(query, prior_j)²。无先前 turn 时 ν=1。"""
     if prior_vecs.size == 0:
@@ -672,12 +689,11 @@ def decayed_strength(node: AkashaNode, now_ts: float) -> float:
 
 
 def effective_edge_weight(weight: float, last_used_ts: float, now_ts: float) -> float:
-    """边的 lazy time-decay。引入 Late-LTP，强边保留不可逆的结构性保底。"""
+    """边的 lazy time-decay。"""
     if last_used_ts <= 0:
         return weight
     gap = max(0.0, now_ts - last_used_ts)
-    baseline = min(0.05, weight * 0.2) if weight > 0.1 else 0.0
-    return baseline + (weight - baseline) * math.exp(-gap / EDGE_DECAY_TAU)
+    return weight * math.exp(-gap / EDGE_DECAY_TAU)
 
 
 def bounded_add(value: float, delta: float, cap: float) -> float:
@@ -1279,8 +1295,7 @@ def graph_expand_candidates(
             edge_signal = effective_weight / math.sqrt(max(out_strength * dst_strength, 1e-9))
             direct = max(0.0, direct_scores.get(key, 0.0))
             seed_direct = max(GRAPH_DIRECT_BIAS, max(0.0, direct_scores.get(seed_key, 0.0)))
-            dst_salience_gain = 1.0 + nodes[key].salience
-            candidate_signal = edge_signal * seed_direct * dst_salience_gain
+            candidate_signal = edge_signal * seed_direct
             scored_neighbors.append((candidate_signal, edge_signal, direct, key, effective_weight))
         scored_neighbors.sort(reverse=True, key=lambda item: item[0])
         for candidate_signal, edge_signal, direct, key, edge_weight in scored_neighbors[:GRAPH_EXPAND_LIMIT]:
