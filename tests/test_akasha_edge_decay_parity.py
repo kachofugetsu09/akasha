@@ -17,6 +17,7 @@ import pytest
 HOST_ROOT = Path(os.environ.get("AKASIC_AGENT_ROOT", "/mnt/data/coding/akasic-agent"))
 if not HOST_ROOT.exists():
     pytest.skip("akasic-agent host repo is required", allow_module_level=True)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.append(str(HOST_ROOT))
 
 import plugins.akasha.core as core
