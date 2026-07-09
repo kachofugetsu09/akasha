@@ -120,6 +120,16 @@ ASSISTANT_ONLY_PENALTY = 0.12
 FAN_PENALTY_POWER = 0.10
 ACTIVATION_THRESHOLD = 0.22
 GRAPH_EXPAND_LIMIT = 8
+ADAPTIVE_MIN_ACTIVE = 8
+ADAPTIVE_MAX_ACTIVE = 64
+ADAPTIVE_CANDIDATE_WINDOW = 256
+ADAPTIVE_MAX_WAVES = 4
+ADAPTIVE_ASPECTS = 12
+ADAPTIVE_NOVELTY_EPSILON = 0.010
+ADAPTIVE_NOVELTY_PATIENCE = 3
+ADAPTIVE_EXPANSION_JACCARD = 0.85
+ADAPTIVE_EXPANSION_NEW_WAVE_RATIO = 0.10
+ADAPTIVE_EXPANSION_COVERAGE_DELTA = 0.015
 GRAPH_DIRECT_BIAS = 0.25
 
 # RWR 重启概率 α：扩散迭代和 path_info 各 hop 权重都由它推出，
@@ -257,6 +267,17 @@ class CoreConfig:
     soft_recall_threshold: float = 0.165
     soft_recall_direct_floor: float = 0.45
     activate_limit: int = 8
+    adaptive_recall: bool = True
+    adaptive_min_active: int = ADAPTIVE_MIN_ACTIVE
+    adaptive_max_active: int = ADAPTIVE_MAX_ACTIVE
+    adaptive_candidate_window: int = ADAPTIVE_CANDIDATE_WINDOW
+    adaptive_max_waves: int = ADAPTIVE_MAX_WAVES
+    adaptive_aspects: int = ADAPTIVE_ASPECTS
+    adaptive_novelty_epsilon: float = ADAPTIVE_NOVELTY_EPSILON
+    adaptive_novelty_patience: int = ADAPTIVE_NOVELTY_PATIENCE
+    adaptive_expansion_jaccard: float = ADAPTIVE_EXPANSION_JACCARD
+    adaptive_expansion_new_wave_ratio: float = ADAPTIVE_EXPANSION_NEW_WAVE_RATIO
+    adaptive_expansion_coverage_delta: float = ADAPTIVE_EXPANSION_COVERAGE_DELTA
 
 
 @dataclass(frozen=True)
@@ -340,12 +361,25 @@ class _GraphPathAggregate:
     direct: float = 0.0
     paths: float = 0.0
     seed_key: str = ""
+    best_wave: int = 1
+
+
+@dataclass(frozen=True)
+class _AdaptiveSelection:
+    items: list[AkashaCandidate]
+    gains: list[float]
+    coverage: float
 
 
 @dataclass(frozen=True)
 class ActivationTrace:
     seed_count: int
     pool_count: int
+    expand_waves: int = 0
+    candidate_count: int = 0
+    selected_count: int = 0
+    novelty_tail: float = 0.0
+    coverage: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1327,8 +1361,11 @@ def graph_expand_candidates(
     edges_by_src: dict[str, dict[str, float]] | None,
     edges_meta: dict[tuple[str, str], float] | None,
     graph_seed_keys: list[str],
+    *,
+    max_waves: int = 1,
+    expand_limit: int = GRAPH_EXPAND_LIMIT,
 ) -> list[AkashaCandidate]:
-    """沿 Dense 种子的强共激活边补一跳候选。"""
+    """沿 Dense 种子的强共激活边补候选。"""
     if edges_by_src is None or not graph_seed_keys:
         return []
 
@@ -1348,39 +1385,53 @@ def graph_expand_candidates(
             in_strength[dst_key] = in_strength.get(dst_key, 0.0) + _eff(src_key, dst_key, edge_weight)
 
     aggregate: dict[str, _GraphPathAggregate] = {}
-    for seed_key in graph_seed_keys:
-        if seed_key not in nodes:
-            continue
-        raw_neighbors = edges_by_src.get(seed_key, {})
-        out_strength = sum(
-            _eff(seed_key, dst_key, edge_weight)
-            for dst_key, edge_weight in raw_neighbors.items()
-        )
-        if out_strength <= 0:
-            continue
-
-        scored_neighbors: list[tuple[float, float, float, str, float]] = []
-        for key, edge_weight in raw_neighbors.items():
-            if key not in nodes or key in seed_set or not has_user_turn(source_cursor, key):
+    frontier: dict[str, tuple[str, float]] = {
+        key: (key, max(GRAPH_DIRECT_BIAS, max(0.0, direct_scores.get(key, 0.0))))
+        for key in graph_seed_keys
+        if key in nodes
+    }
+    seen = set(seed_set)
+    for wave in range(1, max(1, max_waves) + 1):
+        next_frontier: dict[str, tuple[str, float]] = {}
+        wave_decay = math.pow(0.68, wave - 1)
+        for frontier_key, (root_seed, root_energy) in frontier.items():
+            raw_neighbors = edges_by_src.get(frontier_key, {})
+            out_strength = sum(
+                _eff(frontier_key, dst_key, edge_weight)
+                for dst_key, edge_weight in raw_neighbors.items()
+            )
+            if out_strength <= 0:
                 continue
-            effective_weight = _eff(seed_key, key, edge_weight)
-            dst_strength = in_strength.get(key, effective_weight)
-            edge_signal = effective_weight / math.sqrt(max(out_strength * dst_strength, 1e-9))
-            direct = max(0.0, direct_scores.get(key, 0.0))
-            seed_direct = max(GRAPH_DIRECT_BIAS, max(0.0, direct_scores.get(seed_key, 0.0)))
-            candidate_signal = edge_signal * seed_direct
-            scored_neighbors.append((candidate_signal, edge_signal, direct, key, effective_weight))
-        scored_neighbors.sort(reverse=True, key=lambda item: item[0])
-        for candidate_signal, edge_signal, direct, key, edge_weight in scored_neighbors[:GRAPH_EXPAND_LIMIT]:
-            item = aggregate.setdefault(key, _GraphPathAggregate(direct=direct, seed_key=seed_key))
-            item.signal += candidate_signal
-            item.paths += 1.0
-            item.direct = max(item.direct, direct)
-            if candidate_signal > item.best_signal:
-                item.best_signal = candidate_signal
-                item.best_edge = edge_signal
-                item.best_weight = edge_weight
-                item.seed_key = seed_key
+
+            scored_neighbors: list[tuple[float, float, float, str, float]] = []
+            for key, edge_weight in raw_neighbors.items():
+                if key not in nodes or key in seed_set or not has_user_turn(source_cursor, key):
+                    continue
+                effective_weight = _eff(frontier_key, key, edge_weight)
+                dst_strength = in_strength.get(key, effective_weight)
+                edge_signal = effective_weight / math.sqrt(max(out_strength * dst_strength, 1e-9))
+                direct = max(0.0, direct_scores.get(key, 0.0))
+                candidate_signal = edge_signal * root_energy * wave_decay
+                scored_neighbors.append((candidate_signal, edge_signal, direct, key, effective_weight))
+            scored_neighbors.sort(reverse=True, key=lambda item: item[0])
+            per_node_limit = max(GRAPH_EXPAND_LIMIT, min(16, expand_limit))
+            for candidate_signal, edge_signal, direct, key, edge_weight in scored_neighbors[:per_node_limit]:
+                item = aggregate.setdefault(key, _GraphPathAggregate(direct=direct, seed_key=root_seed))
+                item.signal += candidate_signal
+                item.paths += 1.0
+                item.direct = max(item.direct, direct)
+                if candidate_signal > item.best_signal:
+                    item.best_signal = candidate_signal
+                    item.best_edge = edge_signal
+                    item.best_weight = edge_weight
+                    item.seed_key = root_seed
+                    item.best_wave = wave
+                if key not in seen:
+                    next_frontier[key] = (root_seed, max(candidate_signal, GRAPH_DIRECT_BIAS * wave_decay))
+        if not next_frontier:
+            break
+        seen.update(next_frontier)
+        frontier = next_frontier
 
     candidates: list[AkashaCandidate] = []
     for key, item in aggregate.items():
@@ -1391,15 +1442,16 @@ def graph_expand_candidates(
         paths = max(1.0, item.paths)
         signal = item.signal * (1.0 + math.log(paths))
         score = 6.0 * signal * (GRAPH_DIRECT_BIAS + direct) * (1.0 + 0.15 * long_score)
+        path_type = f"{max(1, item.best_wave)}hop"
         candidates.append(AkashaCandidate(
             key=key, source="Graph", ripple=item.best_weight,
             direct=direct, state=0.0, edge=signal,
             long=long_score, resource=resource, fan=max(0, fan.get(key, 0)),
-            score=float(score * resource), path_type="1hop",
+            score=float(score * resource), path_type=path_type,
             seed_key=item.seed_key, path_value=item.best_edge,
         ))
     candidates.sort(key=lambda item: item.score, reverse=True)
-    return candidates[:GRAPH_EXPAND_LIMIT]
+    return candidates[:expand_limit]
 
 
 def merge_active_candidates(
@@ -1414,6 +1466,149 @@ def merge_active_candidates(
             best_by_key[item.key] = item
     merged = sorted(best_by_key.values(), key=lambda item: item.score, reverse=True)
     return merged[:limit]
+
+
+def _unit_vector(vector: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(vector)
+    return vector / norm if norm > 0 else vector
+
+
+def _softmax(values: np.ndarray, beta: float) -> np.ndarray:
+    scaled = beta * values
+    scaled -= float(np.max(scaled))
+    exp = np.exp(scaled)
+    total = float(np.sum(exp))
+    return exp / total if total > 0 else np.full_like(exp, 1.0 / len(exp))
+
+
+def _aspect_centers(
+    keys: list[str],
+    nodes: dict[str, AkashaNode],
+    *,
+    aspect_count: int,
+) -> np.ndarray:
+    if not keys:
+        return np.empty((0, 0), dtype=np.float32)
+    pool = keys[:max(8, min(len(keys), len(keys) // 4 or 8))]
+    matrix = np.vstack([nodes[key].embedding for key in pool]).astype(np.float32)
+    k = max(1, min(aspect_count, len(pool)))
+    if k == 1:
+        return np.vstack([_unit_vector(matrix.mean(axis=0))])
+    picks = np.linspace(0, len(pool) - 1, k, dtype=int)
+    centers = matrix[picks]
+    for _ in range(18):
+        labels = (matrix @ centers.T).argmax(axis=1)
+        next_centers = []
+        for index in range(k):
+            points = matrix[labels == index]
+            if len(points) == 0:
+                next_centers.append(centers[index])
+            else:
+                next_centers.append(_unit_vector(points.mean(axis=0)))
+        centers = np.vstack(next_centers)
+    return centers
+
+
+def _select_context_slate(
+    candidates: list[AkashaCandidate],
+    query_vec: np.ndarray,
+    nodes: dict[str, AkashaNode],
+    config: CoreConfig,
+) -> _AdaptiveSelection:
+    best_by_key: dict[str, AkashaCandidate] = {}
+    for item in candidates:
+        node = nodes.get(item.key)
+        if node is None:
+            continue
+        current = best_by_key.get(item.key)
+        if current is None or item.score > current.score:
+            best_by_key[item.key] = item
+    ranked = sorted(
+        best_by_key.values(),
+        key=lambda item: (
+            max(0.0, item.direct),
+            item.score,
+            item.edge,
+            item.path_value,
+        ),
+        reverse=True,
+    )[:max(config.adaptive_candidate_window, config.adaptive_max_active)]
+    if not ranked:
+        return _AdaptiveSelection([], [], 0.0)
+
+    aspect_items = ranked[:max(4, min(config.adaptive_aspects, len(ranked)))]
+    centers = np.vstack([nodes[item.key].embedding for item in aspect_items])
+    aspect_prior = _softmax(centers @ query_vec, beta=8.0)
+    covered = np.zeros(len(aspect_prior), dtype=np.float32)
+    matrix = np.vstack([nodes[item.key].embedding for item in ranked])
+    aspect_prob = np.vstack([
+        _softmax(centers @ nodes[item.key].embedding, beta=8.0)
+        for item in ranked
+    ])
+    relevance = np.array([max(0.0, item.direct) for item in ranked], dtype=np.float32)
+    raw_score = np.array([max(0.0, item.score) for item in ranked], dtype=np.float32)
+    raw_edge = np.array([max(0.0, item.edge, item.path_value) for item in ranked], dtype=np.float32)
+    activation = raw_score / max(float(np.max(raw_score)), 1e-9)
+    graph_support = raw_edge / max(float(np.max(raw_edge)), 1e-9)
+    path_closeness = np.array([
+        {
+            "direct": 1.0,
+            "bridge": 0.88,
+            "1hop": 0.78,
+            "2hop": 0.58,
+            "3hop": 0.42,
+            "4hop": 0.32,
+        }.get(item.path_type, 0.32)
+        for item in ranked
+    ], dtype=np.float32)
+    available = np.ones(len(ranked), dtype=bool)
+    selected_indices: list[int] = []
+    gains: list[float] = []
+    low_gain_rounds = 0
+
+    while available.any() and len(selected_indices) < config.adaptive_max_active:
+        novelty = (aspect_prob * (aspect_prior * (1.0 - covered))).sum(axis=1)
+        if selected_indices:
+            redundancy = np.maximum(matrix[selected_indices] @ matrix.T, 0.0).max(axis=0)
+        else:
+            redundancy = np.zeros(len(ranked), dtype=np.float32)
+        scores = (
+            0.42 * relevance
+            + 0.18 * activation
+            + 0.20 * novelty
+            + 0.12 * graph_support
+            + 0.08 * path_closeness
+            - 0.12 * redundancy
+        )
+        scores[~available] = -1e9
+        index = int(np.argmax(scores))
+        selected_indices.append(index)
+        available[index] = False
+        novelty_gain = float(novelty[index])
+        gains.append(novelty_gain)
+        covered = 1.0 - (1.0 - covered) * (1.0 - aspect_prob[index])
+
+        if len(selected_indices) >= config.adaptive_min_active:
+            low_gain_rounds = (
+                low_gain_rounds + 1
+                if novelty_gain < config.adaptive_novelty_epsilon
+                else 0
+            )
+            if low_gain_rounds >= config.adaptive_novelty_patience:
+                break
+    return _AdaptiveSelection(
+        [ranked[index] for index in selected_indices],
+        gains,
+        float(np.dot(aspect_prior, covered)),
+    )
+
+
+def _slate_jaccard(left: list[AkashaCandidate], right: list[AkashaCandidate]) -> float:
+    left_keys = {item.key for item in left}
+    right_keys = {item.key for item in right}
+    if not left_keys and not right_keys:
+        return 1.0
+    return len(left_keys & right_keys) / max(1, len(left_keys | right_keys))
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────
@@ -1502,23 +1697,60 @@ def compute_candidates(
         current = (1.0 - RWR_RESTART_ALPHA) * np.dot(transition, current) + RWR_RESTART_ALPHA * e0
 
     path_info_dict = path_info(valid_keys, transition, e0, te0)
+    pool_limit = (
+        max(config.adaptive_candidate_window, config.adaptive_max_active)
+        if config.adaptive_recall
+        else (return_limit or config.activate_limit)
+    )
     candidates, suppressed = score_candidates(
         valid_keys, nodes, direct_scores_map, seed_sources,
         current, state_arr, cross_mat, fan, now_ts,
         path_info_dict, config, source_cursor,
-        soft_recall=soft_recall, return_limit=return_limit,
+        soft_recall=soft_recall, return_limit=pool_limit,
     )
+    selected = _select_context_slate(candidates, query_vec, nodes, config) if config.adaptive_recall else None
+    expand_waves = 0
     if graph_seed_keys:
         graph_candidates = graph_expand_candidates(
             query_vec, nodes, direct_scores_map, fan, now_ts,
             source_cursor, edges_by_src, edges_meta, graph_seed_keys,
+            max_waves=1, expand_limit=pool_limit,
         )
+        merged_pool = merge_active_candidates(candidates, graph_candidates, pool_limit)
+        if config.adaptive_recall:
+            selected = _select_context_slate(merged_pool, query_vec, nodes, config)
+            candidates = selected.items
+        else:
+            candidates = merged_pool[:return_limit or config.activate_limit]
+        expand_waves = 1
+    elif config.adaptive_recall and selected is not None:
+        candidates = selected.items
+    else:
         limit = return_limit or config.activate_limit
-        candidates = merge_active_candidates(candidates, graph_candidates, limit)
+        candidates = candidates[:limit]
+
+    if config.adaptive_recall and not graph_seed_keys and selected is None:
+        selected = _AdaptiveSelection(candidates, [], 0.0)
+    if config.adaptive_recall and selected is not None:
+        candidates = selected.items
+
+    limit = return_limit or config.activate_limit
+    if not config.adaptive_recall:
+        candidates = candidates[:limit]
+    else:
+        candidates = candidates[:config.adaptive_max_active]
+
+    if graph_seed_keys:
         active_keys = {item.key for item in candidates}
         suppressed = [item for item in suppressed if item.key not in active_keys]
     return candidates, suppressed, ActivationTrace(
-        seed_count=len(seed_sources), pool_count=len(valid_keys),
+        seed_count=len(seed_sources),
+        pool_count=len(valid_keys),
+        expand_waves=expand_waves,
+        candidate_count=len(candidates),
+        selected_count=len(candidates),
+        novelty_tail=(selected.gains[-1] if selected and selected.gains else 0.0),
+        coverage=(selected.coverage if selected else 0.0),
     )
 
 

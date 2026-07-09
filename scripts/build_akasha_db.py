@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import enum
 import json
 import shutil
 import sqlite3
 import sys
+import types
 from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -18,6 +20,67 @@ import numpy as np
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+def _install_rebuild_stubs() -> None:
+    def mod(name: str) -> types.ModuleType:
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        return module
+
+    for package in ["agent", "bus", "core", "core.memory", "core.net", "memory2"]:
+        sys.modules.setdefault(package, types.ModuleType(package))
+
+    sys.modules.setdefault("agent.config_models", types.ModuleType("agent.config_models"))
+    sys.modules["agent.config_models"].Config = type("Config", (), {})
+    sys.modules.setdefault("bus.events_lifecycle", types.ModuleType("bus.events_lifecycle"))
+    sys.modules["bus.events_lifecycle"].TurnCommitted = type("TurnCommitted", (), {})
+    sys.modules.setdefault("bus.event_bus", types.ModuleType("bus.event_bus"))
+    sys.modules["bus.event_bus"].EventBus = type("EventBus", (), {})
+    sys.modules.setdefault("core.net.http", types.ModuleType("core.net.http"))
+    sys.modules["core.net.http"].SharedHttpResources = type("SharedHttpResources", (), {})
+    sys.modules.setdefault("memory2.embedder", types.ModuleType("memory2.embedder"))
+    sys.modules["memory2.embedder"].Embedder = type("Embedder", (), {})
+
+    core_memory = sys.modules.get("core.memory.engine") or mod("core.memory.engine")
+
+    class EngineProfile(enum.Enum):
+        RICH_MEMORY_ENGINE = "rich_memory_engine"
+
+    class MemoryCapability(enum.Enum):
+        INGEST_MESSAGES = "ingest_messages"
+        RETRIEVE_SEMANTIC = "retrieve_semantic"
+        RETRIEVE_CONTEXT_BLOCK = "retrieve_context_block"
+        RETRIEVE_STRUCTURED_HITS = "retrieve_structured_hits"
+        SEMANTICS_RICH_MEMORY = "semantics_rich_memory"
+
+    class MemoryEngineDescriptor:
+        def __init__(self, *, name, profile, capabilities, notes=None):
+            self.name = name
+            self.profile = profile
+            self.capabilities = capabilities
+            self.notes = notes or {}
+
+    core_memory.EngineProfile = EngineProfile
+    core_memory.MemoryCapability = MemoryCapability
+    core_memory.MemoryEngineDescriptor = MemoryEngineDescriptor
+    for name in [
+        "EvidenceRef",
+        "MemoryIngestRequest",
+        "MemoryIngestResult",
+        "MemoryMutation",
+        "MemoryMutationResult",
+        "MemoryQuery",
+        "MemoryQueryResult",
+        "MemoryRecord",
+        "MemoryScope",
+        "MemoryToolProfile",
+        "MemoryToolSpec",
+    ]:
+        setattr(core_memory, name, type(name, (), {}))
+
+
+_install_rebuild_stubs()
 
 from plugins.akasha.config import (
     AkashaConfig,
