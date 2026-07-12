@@ -1,266 +1,322 @@
-"use strict";
-(() => {
-  function ai_fmt2(v) {
-    if (v == null) return "-";
-    return v.toFixed(2);
+// plugins/akasha/dashboard_panel_inspector.ts
+function ai_fmtScore(v) {
+  if (v == null) return "-";
+  const n = Number(v);
+  const cls = n >= 0.5 ? "ai-score-hi" : n >= 0.25 ? "ai-score-mid" : "ai-score-lo";
+  return `<span class="ai-score ${cls}">${n.toFixed(3)}</span>`;
+}
+function ai_sourceTag(source) {
+  const cls = {
+    Dense: "ai-src-dense",
+    "Dense(FB)": "ai-src-densefb",
+    FTS: "ai-src-fts",
+    BlackHole: "ai-src-blackhole",
+    Bridge: "ai-src-bridge"
+  }[source] ?? "ai-src-other";
+  return `<span class="ai-tag ${cls}">${escapeHtml(source)}</span>`;
+}
+function ai_pathTag(pt) {
+  const cls = {
+    direct: "ai-path-direct",
+    "1hop": "ai-path-1hop",
+    "2hop": "ai-path-2hop",
+    bridge: "ai-path-bridge"
+  }[pt] ?? "";
+  return `<span class="ai-tag ${cls}">${escapeHtml(pt)}</span>`;
+}
+function ai_suppressedTag(s) {
+  if (!s) return "";
+  return `<span class="ai-tag ai-suppressed">${escapeHtml(s)}</span>`;
+}
+function ai_shortKey(key) {
+  const parts = key.split(":");
+  if (parts.length >= 2) {
+    const seq = parts[parts.length - 1];
+    const sk = parts.slice(0, -1).join(":");
+    const short = sk.length > 20 ? "\u2026" + sk.slice(-18) : sk;
+    return `${short}:${seq}`;
   }
-  function ai_fmtScore(v) {
-    if (v == null) return "-";
-    const n = Number(v);
-    const cls = n >= 0.5 ? "ai-score-hi" : n >= 0.25 ? "ai-score-mid" : "ai-score-lo";
-    return `<span class="ai-score ${cls}">${n.toFixed(3)}</span>`;
-  }
-  function ai_sourceTag(source) {
-    const cls = {
-      Dense: "ai-src-dense",
-      "Dense(FB)": "ai-src-densefb",
-      FTS: "ai-src-fts",
-      BlackHole: "ai-src-blackhole",
-      Bridge: "ai-src-bridge"
-    }[source] ?? "ai-src-other";
-    return `<span class="ai-tag ${cls}">${escapeHtml(source)}</span>`;
-  }
-  function ai_pathTag(pt) {
-    const cls = {
-      direct: "ai-path-direct",
-      "1hop": "ai-path-1hop",
-      "2hop": "ai-path-2hop",
-      bridge: "ai-path-bridge"
-    }[pt] ?? "";
-    return `<span class="ai-tag ${cls}">${escapeHtml(pt)}</span>`;
-  }
-  function ai_suppressedTag(s) {
-    if (!s) return "";
-    return `<span class="ai-tag ai-suppressed">${escapeHtml(s)}</span>`;
-  }
-  function ai_shortKey(key) {
-    const parts = key.split(":");
-    if (parts.length >= 2) {
-      const seq = parts[parts.length - 1];
-      const sk = parts.slice(0, -1).join(":");
-      const short = sk.length > 20 ? "\u2026" + sk.slice(-18) : sk;
-      return `${short}:${seq}`;
+  return key;
+}
+function ai_shortTs(value) {
+  if (!value) return "-";
+  const d = new Date(String(value));
+  if (isNaN(d.getTime())) return String(value);
+  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+function ai_renderFilters(container, dispatch) {
+  const q = dispatch.filters["q"] ?? "";
+  const existing = container.querySelector("[data-ai-search]");
+  if (existing) {
+    if (document.activeElement !== existing && existing.value !== q) {
+      existing.value = q;
     }
-    return key;
+    return;
   }
-  function ai_shortTs(value) {
-    if (!value) return "-";
-    const d = new Date(String(value));
-    if (isNaN(d.getTime())) return String(value);
-    return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  container.innerHTML = `
+    <div class="filter-row">
+      <label class="search"><span>\u2315</span><input type="text" placeholder="\u641C\u7D22 query / session" value="${escapeHtml(q)}" data-ai-search /></label>
+      <button class="ghost" type="button" data-ai-clear ${q ? "" : "disabled"}>\u6E05\u7A7A</button>
+    </div>
+  `;
+  const input = container.querySelector("[data-ai-search]");
+  const clear = container.querySelector("[data-ai-clear]");
+  let debounceTimer = 0;
+  input.addEventListener("input", () => {
+    window.clearTimeout(debounceTimer);
+    debounceTimer = window.setTimeout(() => {
+      const value = input.value.trim();
+      if (value) dispatch.setFilter("q", value);
+      else dispatch.clearFilter("q");
+    }, 250);
+  });
+  clear.addEventListener("click", () => {
+    input.value = "";
+    dispatch.clearFilter("q");
+  });
+}
+var _expanderId = 0;
+function ai_textExpander(text, isAssistant = false) {
+  if (!text) return "-";
+  const size = isAssistant ? "11.5px" : "13px";
+  const lineH = isAssistant ? "1.4" : "1.5";
+  if (text.length < 60 && !text.includes("\n")) {
+    return `<div style="font-size:${size}; color:var(--color-${isAssistant ? "muted" : "fg"}); padding:4px 0; line-height:${lineH};">${escapeHtml(text)}</div>`;
   }
-  function ai_renderActivationTable(items) {
-    if (!items.length) {
-      return '<div class="ai-empty">\u65E0\u6FC0\u6D3B\u8282\u70B9</div>';
-    }
-    const rows = items.map((item) => `
-    <tr class="${item.suppressed ? "ai-row-suppressed" : ""}">
-      <td class="ai-cell-msg" title="${escapeHtml(item.user_message)}">${escapeHtml(item.user_message || "-")}</td>
-      <td class="ai-cell-preview" title="${escapeHtml(item.assistant_preview)}">${escapeHtml(item.assistant_preview || "-")}</td>
-      <td class="ai-cell-num">${ai_fmtScore(item.score)}</td>
-      <td>${ai_sourceTag(item.source)}</td>
-      <td>${ai_pathTag(item.path_type)}${ai_suppressedTag(item.suppressed)}</td>
-      <td class="ai-cell-num mono">${item.fan}</td>
-      <td class="ai-cell-num mono">${ai_fmt2(item.direct)}</td>
-      <td class="ai-cell-num mono">${ai_fmt2(item.state)}</td>
-      <td class="ai-cell-num mono">${ai_fmt2(item.edge)}</td>
-      <td class="ai-cell-num mono">${ai_fmt2(item.long)}</td>
-      <td class="ai-cell-num mono">${ai_fmt2(item.resource)}</td>
-    </tr>
+  const id = `ai-exp-${++_expanderId}`;
+  return `
+    <div class="ai-expander ${isAssistant ? "ai-exp-asst" : ""}">
+      <input type="checkbox" id="${id}" class="ai-exp-cb" style="display:none;" />
+      <label for="${id}" class="ai-exp-header">
+        <span class="ai-exp-icon">\u25B6</span>
+        <span class="ai-exp-text-closed" style="font-size:${size}">${escapeHtml(text.replace(/\n/g, " "))}</span>
+        <span class="ai-exp-text-open">Collapse</span>
+      </label>
+      <div class="ai-exp-full">
+        <div class="ai-exp-full-inner" style="font-size:${size}">${escapeHtml(text)}</div>
+      </div>
+    </div>
+  `;
+}
+function ai_assistantPreview(text) {
+  if (!text) return "";
+  const prefixedText = `ASST: ${text}`;
+  return `<div class="ai-asst-expander-wrap">${ai_textExpander(prefixedText, true)}</div>`;
+}
+function ai_sparkbar(label, v) {
+  if (v == null) return "";
+  const percent = Math.min(100, Math.max(0, v * 100));
+  return `
+    <div class="ai-act-metric">
+      <span class="ai-act-m-k">${label}</span>
+      <div class="ai-spark-track"><div class="ai-spark-fill" style="width: ${percent}%;"></div></div>
+    </div>
+  `;
+}
+function ai_renderActivationTable(items) {
+  if (!items.length) {
+    return '<div class="ai-empty">\u65E0\u6FC0\u6D3B\u8282\u70B9</div>';
+  }
+  const rows = items.map((item) => `
+    <div class="ai-act-card ${item.suppressed ? "ai-row-suppressed" : ""}">
+      <div class="ai-act-head">
+        ${ai_fmtScore(item.score)}
+        ${ai_sourceTag(item.source)}
+        ${ai_pathTag(item.path_type)}${ai_suppressedTag(item.suppressed)}
+      </div>
+      <div class="ai-act-body">
+        ${ai_textExpander(item.user_message)}
+        ${ai_assistantPreview(item.assistant_preview)}
+      </div>
+      <div class="ai-act-metrics">
+        <div class="ai-act-metric"><span class="ai-act-m-k">FAN</span><span class="ai-act-m-v mono">${item.fan}</span></div>
+        ${ai_sparkbar("DIR", item.direct)}
+        ${ai_sparkbar("STA", item.state)}
+        ${ai_sparkbar("EDG", item.edge)}
+        ${ai_sparkbar("LNG", item.long)}
+        ${ai_sparkbar("RES", item.resource)}
+      </div>
+    </div>
   `).join("");
-    return `
-    <div class="ai-table-wrap">
-      <table class="ai-table ai-table-cards">
-        <thead>
-          <tr>
-            <th class="ai-th-msg">user</th>
-            <th class="ai-th-preview">assistant</th>
-            <th>score</th><th>source</th><th>path</th>
-            <th>fan</th><th>direct</th><th>state</th><th>edge</th><th>long</th><th>resource</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
-  `;
+  return `<div class="ai-act-list">${rows}</div>`;
+}
+function ai_renderCardTable(items, type) {
+  if (!items.length) {
+    return '<div class="ai-empty">\u65E0\u8BB0\u5F55</div>';
   }
-  function ai_renderCardTable(items, showPath) {
-    if (!items.length) {
-      return '<div class="ai-empty">\u65E0\u8BB0\u5F55</div>';
-    }
-    const extraHeaders = showPath ? "<th>path</th><th>seed</th><th>bridge</th>" : "";
-    const rows = items.map((item) => {
-      const srcRefIds = (() => {
-        try {
-          return JSON.parse(item.source_ref);
-        } catch {
-          return [];
-        }
-      })();
-      const srcRefLink = srcRefIds.length ? `<span class="ai-source-ref" title="${escapeHtml(item.source_ref)}">${srcRefIds.length} msg</span>` : "-";
-      const extraCells = showPath ? `<td>${ai_pathTag(item.path_type)}${ai_suppressedTag(item.suppressed)}</td>
-         <td class="mono ai-cell-key" title="${escapeHtml(item.seed_key)}">${escapeHtml(ai_shortKey(item.seed_key))}</td>
-         <td class="mono ai-cell-key" title="${escapeHtml(item.bridge_key)}">${escapeHtml(ai_shortKey(item.bridge_key))}</td>` : "";
-      return `
-      <tr>
-        <td class="ai-cell-msg">${escapeHtml(item.user_message)}</td>
-        <td class="ai-cell-preview">${escapeHtml(item.assistant_preview)}</td>
-        <td class="ai-cell-num">${ai_fmtScore(item.score)}</td>
-        <td>${ai_sourceTag(item.source)}</td>
-        ${extraCells}
-        <td>${srcRefLink}</td>
-      </tr>
+  const showPath = type === "ripple";
+  const cards = items.map((item) => {
+    const srcRefIds = (() => {
+      try {
+        return JSON.parse(item.source_ref);
+      } catch {
+        return [];
+      }
+    })();
+    const refCount = srcRefIds.length;
+    return `
+      <div class="ai-mem-card">
+        <div class="ai-mem-card-head">
+          ${ai_fmtScore(item.score)}
+          ${ai_sourceTag(item.source)}
+          ${showPath ? ai_pathTag(item.path_type) + ai_suppressedTag(item.suppressed) : ""}
+          <div style="flex:1"></div>
+          ${refCount > 0 ? `<span class="ai-source-ref" title="${escapeHtml(item.source_ref)}">${refCount} refs</span>` : ""}
+        </div>
+        <div class="ai-mem-card-body">
+          ${ai_textExpander(item.user_message)}
+          ${ai_assistantPreview(item.assistant_preview)}
+        </div>
+        ${showPath ? `<div class="ai-mem-card-foot"><div class="ai-mem-foot-item"><span>SEED</span> <span class="mono">${escapeHtml(ai_shortKey(item.seed_key))}</span></div><div class="ai-mem-foot-item"><span>BRIDGE</span> <span class="mono">${escapeHtml(ai_shortKey(item.bridge_key))}</span></div></div>` : ""}
+      </div>
     `;
-    }).join("");
-    return `
-    <div class="ai-table-wrap">
-      <table class="ai-table ai-table-cards">
-        <thead>
-          <tr>
-            <th class="ai-th-msg">user</th>
-            <th class="ai-th-preview">assistant</th>
-            <th>score</th>
-            <th>source</th>
-            ${extraHeaders}
-            <th>ref</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
-  `;
-  }
-  function ai_renderEmpty() {
-    return `
+  }).join("");
+  return `<div class="ai-cards-list">${cards}</div>`;
+}
+function ai_renderEmpty() {
+  return `
     <div class="detail-empty">
       <div class="detail-empty-title">Akasha Inspector</div>
       <div class="detail-empty-text">\u70B9\u5F00\u4E00\u8F6E\u68C0\u7D22\u8BB0\u5F55\uFF0C\u8FD9\u91CC\u4F1A\u663E\u793A\u6FC0\u6D3B\u56FE\u3001Dense \u7CBE\u786E\u547D\u4E2D\u3001Ripple \u8054\u60F3\u547D\u4E2D\u548C\u6CE8\u5165\u9884\u89C8\u3002</div>
     </div>
   `;
-  }
-  function ai_renderDetail(item) {
-    const threshold = (item.activation_threshold ?? 0).toFixed(3);
-    return `
-    <div class="detail-wrap ai-inspector">
-      <div class="detail-toolbar">
-        <div>
-          <div class="detail-title">Akasha \u68C0\u7D22\u8BB0\u5F55</div>
-          <div class="detail-subtext mono">${escapeHtml(item.session_key)} \xB7 seq ${item.seq}</div>
+}
+function ai_renderDetail(item, dispatch) {
+  const threshold = (item.activation_threshold ?? 0).toFixed(3);
+  return `
+    <div class="ai-inspector">
+      <div class="ai-query-block">
+        <div class="detail-title" style="display:flex; justify-content:space-between; align-items:flex-start;">
+          <span>Akasha \u68C0\u7D22\u8BB0\u5F55 <span class="detail-subtext mono">(${escapeHtml(item.session_key)} \xB7 seq ${item.seq})</span></span>
+          ${dispatch?.closePane ? `<button class="ai-close-btn" type="button" title="\u5173\u95ED\u8BE6\u60C5\u9762\u677F">\u2715</button>` : ""}
         </div>
-      </div>
-
-      <!-- 1. User Query -->
-      <div class="detail-block">
-        <div class="detail-label">User Query</div>
         <div class="ai-query-text">${escapeHtml(item.query_text)}</div>
         <div class="ai-meta-row">
-          <span class="ai-meta-kv"><span class="ai-meta-k">intent</span><span class="ai-meta-v">${escapeHtml(item.intent)}</span></span>
-          <span class="ai-meta-kv"><span class="ai-meta-k">ts</span><span class="ai-meta-v mono">${escapeHtml(ai_shortTs(item.ts))}</span></span>
+          <span class="ai-meta-kv"><span class="ai-meta-k">Intent</span><span class="ai-meta-v">${escapeHtml(item.intent)}</span></span>
+          <span class="ai-meta-kv"><span class="ai-meta-k">Time</span><span class="ai-meta-v">${escapeHtml(ai_shortTs(item.ts))}</span></span>
         </div>
       </div>
 
-      <!-- 2. Activation \u6FC0\u6D3B -->
-      <div class="detail-block">
-        <div class="detail-label">Activation \u6FC0\u6D3B</div>
-        <div class="ai-stats-row">
-          <div class="ai-stat"><span class="ai-stat-val">${item.seed_count}</span><span class="ai-stat-k">seeds</span></div>
-          <div class="ai-stat-sep">\u2192</div>
-          <div class="ai-stat"><span class="ai-stat-val">${item.pool_count}</span><span class="ai-stat-k">pool</span></div>
-          <div class="ai-stat-sep">\u2192</div>
-          <div class="ai-stat"><span class="ai-stat-val">${item.activated_count}</span><span class="ai-stat-k">activated</span></div>
-          <div class="ai-stat-sep"> / </div>
-          <div class="ai-stat"><span class="ai-stat-val ai-threshold">${threshold}</span><span class="ai-stat-k">threshold</span></div>
+      <!-- KPI Grid -->
+      <div class="ai-kpi-grid">
+        <div class="ai-kpi-card">
+          <div class="ai-kpi-val">${item.seed_count}</div>
+          <div class="ai-kpi-label">SEEDS IGNITED</div>
+        </div>
+        <div class="ai-kpi-card">
+          <div class="ai-kpi-val">${item.pool_count}</div>
+          <div class="ai-kpi-label">POOL SIZE</div>
+        </div>
+        <div class="ai-kpi-card">
+          <div class="ai-kpi-val">${item.activated_count}</div>
+          <div class="ai-kpi-label">ACTIVATED</div>
+        </div>
+        <div class="ai-kpi-card">
+          <div class="ai-kpi-val">${threshold}</div>
+          <div class="ai-kpi-label">THRESHOLD</div>
+        </div>
+      </div>
+
+      <!-- Activation -->
+      <div class="ai-section-container ai-container-act">
+        <div class="ai-section-header">
+          <div class="ai-sh-text">ACTIVATION MATRIX <span class="ai-sh-sub">Neural Graph Propagation</span></div>
+          <div class="ai-sh-count">${item.activation_items?.length || 0}</div>
         </div>
         ${ai_renderActivationTable(item.activation_items || [])}
       </div>
 
-      <!-- 3. Dense \u5DE6\u8111\u8BB0\u5FC6 -->
-      <div class="detail-block">
-        <div class="detail-label">\u5DE6\u8111\u8BB0\u5FC6\uFF1A\u7CBE\u786E\u56DE\u5FC6 <span class="ai-count-badge">${item.dense_count}</span></div>
-        ${ai_renderCardTable(item.dense_items || [], false)}
-      </div>
-
-      <!-- 4. Ripple \u53F3\u8111\u8054\u60F3 -->
-      <div class="detail-block">
-        <div class="detail-label">\u53F3\u8111\u8054\u60F3\uFF1A\u6F5C\u610F\u8BC6\u7B2C\u4E00\u53CD\u5E94 <span class="ai-count-badge">${item.ripple_count}</span></div>
-        ${ai_renderCardTable(item.ripple_items || [], true)}
-      </div>
-
-      <!-- 5. Prompt \u6CE8\u5165 -->
-      <div class="detail-block">
-        <div class="detail-label">Prompt \u6CE8\u5165</div>
-        <div class="ai-stats-row">
-          <div class="ai-stat"><span class="ai-stat-val">${item.dense_count}</span><span class="ai-stat-k">dense</span></div>
-          <div class="ai-stat-sep">+</div>
-          <div class="ai-stat"><span class="ai-stat-val">${item.ripple_count}</span><span class="ai-stat-k">ripple</span></div>
-          <div class="ai-stat-sep">\xB7</div>
-          <div class="ai-stat"><span class="ai-stat-val">${item.inject_chars}</span><span class="ai-stat-k">chars</span></div>
-          <div class="ai-stat-sep">\xB7</div>
-          <div class="ai-stat"><span class="ai-stat-val">${item.source_ref_count}</span><span class="ai-stat-k">refs</span></div>
+      <!-- Left Brain -->
+      <div class="ai-section-container ai-container-dense">
+        <div class="ai-section-header">
+          <div class="ai-sh-text">LEFT BRAIN <span class="ai-sh-sub">Precise Retrieval (Dense)</span></div>
+          <div class="ai-sh-count">${item.dense_count}</div>
         </div>
-        ${item.text_block_preview ? `<details class="ai-preview-block"><summary>\u6CE8\u5165\u6587\u672C\u9884\u89C8</summary><pre class="ai-preview-pre">${escapeHtml(item.text_block_preview)}</pre></details>` : '<div class="ai-empty">\u672C\u8F6E\u65E0\u6CE8\u5165\uFF08\u975E context intent\uFF09</div>'}
+        ${ai_renderCardTable(item.dense_items || [], "dense")}
+      </div>
+
+      <!-- Right Brain -->
+      <div class="ai-section-container ai-container-ripple">
+        <div class="ai-section-header">
+          <div class="ai-sh-text">RIGHT BRAIN <span class="ai-sh-sub">Associative Leaps (Ripple)</span></div>
+          <div class="ai-sh-count">${item.ripple_count}</div>
+        </div>
+        ${ai_renderCardTable(item.ripple_items || [], "ripple")}
+      </div>
+
+      <!-- Prompt Synthesis -->
+      <div class="detail-block">
+        <div class="detail-title" style="margin-bottom:12px; font-size:14px; text-transform:uppercase; color:var(--color-subtle);">Synthesis (Prompt Injection)</div>
+        <div class="ai-meta-row" style="margin-bottom:12px;">
+          <span class="ai-meta-kv"><span class="ai-meta-k">Dense</span><span class="ai-meta-v">${item.dense_count}</span></span>
+          <span class="ai-meta-kv"><span class="ai-meta-k">Ripple</span><span class="ai-meta-v">${item.ripple_count}</span></span>
+          <span class="ai-meta-kv"><span class="ai-meta-k">Total Chars</span><span class="ai-meta-v">${item.inject_chars}</span></span>
+          <span class="ai-meta-kv"><span class="ai-meta-k">Refs</span><span class="ai-meta-v">${item.source_ref_count}</span></span>
+        </div>
+        ${item.text_block_preview ? `<details class="ai-preview-block"><summary>View Injected Context</summary><pre class="ai-preview-pre">${escapeHtml(item.text_block_preview)}</pre></details>` : '<div class="ai-empty">No context injected in this turn.</div>'}
       </div>
     </div>
   `;
-  }
-  window.AkashicDashboard.registerPlugin({
-    id: "akasha_inspector",
-    label: "Akasha Inspector",
-    viewLabel: "akasha inspector",
-    pageSize: 25,
-    rowKey: "query_id",
-    countTitle(total) {
-      return `${total} \u8F6E\u68C0\u7D22`;
-    },
-    columns: [
-      { key: "session_key", label: "Session", width: 108, fmt: "mono-session", cellClass: "mono cell-session", rawTitle: true },
-      {
-        key: "ts",
-        label: "Time",
-        width: 96,
-        fmt: "mono-time",
-        cellClass: "mono cell-time",
-        rawTitle: true,
-        renderCell(value) {
-          return escapeHtml(ai_shortTs(value));
-        }
-      },
-      { key: "query_text", label: "Query", flex: true, fmt: "text-preview", cellClass: "content-preview" },
-      { key: "seed_count", label: "Seeds", width: 60, fmt: "metric", cellClass: "mono cell-metric", align: "right" },
-      { key: "activated_count", label: "Active", width: 60, fmt: "metric", cellClass: "mono cell-metric", align: "right" },
-      { key: "dense_count", label: "Dense", width: 60, fmt: "metric", cellClass: "mono cell-metric", align: "right" },
-      { key: "ripple_count", label: "Ripple", width: 60, fmt: "metric", cellClass: "mono cell-metric", align: "right" },
-      { key: "inject_chars", label: "Chars", width: 70, fmt: "metric", cellClass: "mono cell-metric", align: "right" }
-    ],
-    async getCount() {
-      try {
-        const r = await api("/api/dashboard/akasha-inspector/overview");
-        return r.available ? r.total ?? 0 : null;
-      } catch {
-        return null;
+}
+window.AkashicDashboard.registerPlugin({
+  id: "akasha_inspector",
+  label: "Akasha Inspector",
+  viewLabel: "akasha inspector",
+  pageSize: 25,
+  rowKey: "query_id",
+  countTitle(total) {
+    return `${total} \u8F6E\u68C0\u7D22`;
+  },
+  columns: [
+    { key: "session_key", label: "Session", width: 108, fmt: "mono-session", cellClass: "mono cell-session", rawTitle: true },
+    {
+      key: "ts",
+      label: "Time",
+      width: 96,
+      fmt: "mono-time",
+      cellClass: "mono cell-time",
+      rawTitle: true,
+      renderCell(value) {
+        return escapeHtml(ai_shortTs(value));
       }
     },
-    async fetchPage({ page, pageSize, filters }) {
-      const params = new URLSearchParams();
-      params.set("page", String(page));
-      params.set("page_size", String(pageSize));
-      if (filters?.["session_key"]) params.set("session_key", filters["session_key"]);
-      if (filters?.["q"]) params.set("q", filters["q"]);
-      const data = await api(
-        `/api/dashboard/akasha-inspector/turns?${params.toString()}`
-      );
-      return { items: data.items || [], total: data.total || 0 };
-    },
-    async fetchDetail(item) {
-      const queryId = String(item["query_id"] ?? "");
-      return api(`/api/dashboard/akasha-inspector/turns/${encodePath(queryId)}`);
-    },
-    renderDetail(item, container) {
-      if (!item) {
-        container.innerHTML = ai_renderEmpty();
-        return;
-      }
-      container.innerHTML = ai_renderDetail(item);
+    { key: "query_text", label: "Query", flex: true, fmt: "text-preview", cellClass: "content-preview" }
+  ],
+  renderFilters: ai_renderFilters,
+  async getCount() {
+    try {
+      const r = await api("/api/dashboard/akasha-inspector/overview");
+      return r.available ? r.total ?? 0 : null;
+    } catch {
+      return null;
     }
-  });
-})();
+  },
+  async fetchPage({ page, pageSize, filters }) {
+    const params = new URLSearchParams();
+    params.set("page", String(page));
+    params.set("page_size", String(pageSize));
+    if (filters?.["session_key"]) params.set("session_key", filters["session_key"]);
+    if (filters?.["q"]) params.set("q", filters["q"]);
+    const data = await api(
+      `/api/dashboard/akasha-inspector/turns?${params.toString()}`
+    );
+    return { items: data.items || [], total: data.total || 0 };
+  },
+  async fetchDetail(item) {
+    const queryId = String(item["query_id"] ?? "");
+    return api(`/api/dashboard/akasha-inspector/turns/${encodePath(queryId)}`);
+  },
+  renderDetail(item, container, dispatch) {
+    if (!item) {
+      container.innerHTML = ai_renderEmpty();
+      return;
+    }
+    container.innerHTML = ai_renderDetail(item, dispatch);
+    if (dispatch?.closePane) {
+      const closeBtn = container.querySelector(".ai-close-btn");
+      if (closeBtn) {
+        closeBtn.addEventListener("click", () => dispatch.closePane());
+      }
+    }
+  }
+});
