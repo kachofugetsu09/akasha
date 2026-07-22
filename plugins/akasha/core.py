@@ -1329,78 +1329,64 @@ def graph_expand_candidates(
     edges_meta: dict[tuple[str, str], float] | None,
     graph_seed_keys: list[str],
 ) -> list[AkashaCandidate]:
-    """沿 Dense 种子的强共激活边补一跳候选。"""
+    """沿 mutual k-NN 图做 BFS，返回所有连通节点（自适应大小）。"""
     if edges_by_src is None or not graph_seed_keys:
         return []
 
     def _eff(src_key: str, dst_key: str, weight: float) -> float:
         if edges_meta is None or now_ts <= 0:
             return weight
-        return effective_edge_weight(
-            weight,
-            edges_meta.get((src_key, dst_key), 0.0),
-            now_ts,
-        )
+        return effective_edge_weight(weight, edges_meta.get((src_key, dst_key), 0.0), now_ts)
 
+    # 每个节点的 top-3 最强邻居
+    topk_cache: dict[str, set[str]] = {}
+
+    def _topk(key: str) -> set[str]:
+        if key not in topk_cache:
+            nbrs = edges_by_src.get(key, {})
+            if nbrs:
+                scored = sorted(nbrs.items(), key=lambda x: -_eff(key, x[0], x[1]))[:3]
+                topk_cache[key] = {k for k, _ in scored}
+            else:
+                topk_cache[key] = set()
+        return topk_cache[key]
+
+    # BFS：从 seed 出发，沿 mutual top-3 边扩展
     seed_set = {key for key in graph_seed_keys if key in nodes}
-    in_strength: dict[str, float] = {}
-    for src_key, src_neighbors in edges_by_src.items():
-        for dst_key, edge_weight in src_neighbors.items():
-            in_strength[dst_key] = in_strength.get(dst_key, 0.0) + _eff(src_key, dst_key, edge_weight)
-
-    aggregate: dict[str, _GraphPathAggregate] = {}
-    for seed_key in graph_seed_keys:
-        if seed_key not in nodes:
-            continue
-        raw_neighbors = edges_by_src.get(seed_key, {})
-        out_strength = sum(
-            _eff(seed_key, dst_key, edge_weight)
-            for dst_key, edge_weight in raw_neighbors.items()
-        )
-        if out_strength <= 0:
-            continue
-
-        scored_neighbors: list[tuple[float, float, float, str, float]] = []
-        for key, edge_weight in raw_neighbors.items():
-            if key not in nodes or key in seed_set or not has_user_turn(source_cursor, key):
-                continue
-            effective_weight = _eff(seed_key, key, edge_weight)
-            dst_strength = in_strength.get(key, effective_weight)
-            edge_signal = effective_weight / math.sqrt(max(out_strength * dst_strength, 1e-9))
-            direct = max(0.0, direct_scores.get(key, 0.0))
-            seed_direct = max(GRAPH_DIRECT_BIAS, max(0.0, direct_scores.get(seed_key, 0.0)))
-            candidate_signal = edge_signal * seed_direct
-            scored_neighbors.append((candidate_signal, edge_signal, direct, key, effective_weight))
-        scored_neighbors.sort(reverse=True, key=lambda item: item[0])
-        for candidate_signal, edge_signal, direct, key, edge_weight in scored_neighbors[:GRAPH_EXPAND_LIMIT]:
-            item = aggregate.setdefault(key, _GraphPathAggregate(direct=direct, seed_key=seed_key))
-            item.signal += candidate_signal
-            item.paths += 1.0
-            item.direct = max(item.direct, direct)
-            if candidate_signal > item.best_signal:
-                item.best_signal = candidate_signal
-                item.best_edge = edge_signal
-                item.best_weight = edge_weight
-                item.seed_key = seed_key
+    visited = set(seed_set)
+    frontier = list(seed_set)
+    while frontier:
+        node = frontier.pop()
+        for nbr in _topk(node):
+            if nbr in nodes and nbr not in visited and node in _topk(nbr):
+                visited.add(nbr)
+                frontier.append(nbr)
 
     candidates: list[AkashaCandidate] = []
-    for key, item in aggregate.items():
+    for key in visited:
+        if key in seed_set or not has_user_turn(source_cursor, key):
+            continue
         node = nodes[key]
         resource = recover_resource(node, now_ts)
         long_score = min(1.0, node.strength / STRENGTH_CAP)
-        direct = item.direct
-        paths = max(1.0, item.paths)
-        signal = item.signal * (1.0 + math.log(paths))
+        direct = max(0.0, direct_scores.get(key, 0.0))
+        best_w = 0.0
+        for nbr in _topk(key):
+            if nbr in visited:
+                w = _eff(key, nbr, edges_by_src.get(key, {}).get(nbr, 0.0))
+                best_w = max(best_w, w)
+        signal = best_w
         score = 6.0 * signal * (GRAPH_DIRECT_BIAS + direct) * (1.0 + 0.15 * long_score)
         candidates.append(AkashaCandidate(
-            key=key, source="Graph", ripple=item.best_weight,
+            key=key, source="Graph", ripple=signal,
             direct=direct, state=0.0, edge=signal,
             long=long_score, resource=resource, fan=max(0, fan.get(key, 0)),
-            score=float(score * resource), path_type="1hop",
-            seed_key=item.seed_key, path_value=item.best_edge,
+            score=float(score * resource), path_type="bfs",
+            seed_key=graph_seed_keys[0] if graph_seed_keys else "",
+            path_value=best_w,
         ))
     candidates.sort(key=lambda item: item.score, reverse=True)
-    return candidates[:GRAPH_EXPAND_LIMIT]
+    return candidates
 
 
 def merge_active_candidates(
@@ -1510,12 +1496,18 @@ def compute_candidates(
         soft_recall=soft_recall, return_limit=return_limit,
     )
     if graph_seed_keys:
+        # BFS 起点多样化：dense seed + RWR 候选 + FTS seed
+        # 确保从多个 micro episode 同时出发 BFS
+        bfs_seeds = list(graph_seed_keys)
+        for c in candidates:
+            if c.key not in bfs_seeds and c.source in ("Dense", "Dense+FTS", "FTS", "Bridge"):
+                bfs_seeds.append(c.key)
         graph_candidates = graph_expand_candidates(
             query_vec, nodes, direct_scores_map, fan, now_ts,
-            source_cursor, edges_by_src, edges_meta, graph_seed_keys,
+            source_cursor, edges_by_src, edges_meta, bfs_seeds,
         )
-        limit = return_limit or DEFAULT_ACTIVATION_LIMIT
-        candidates = merge_active_candidates(candidates, graph_candidates, limit)
+        # BFS 候选不受 return_limit 截断：连通分量大小自适应
+        candidates = merge_active_candidates(candidates, graph_candidates, len(candidates) + len(graph_candidates))
         active_keys = {item.key for item in candidates}
         suppressed = [item for item in suppressed if item.key not in active_keys]
     return candidates, suppressed, ActivationTrace(

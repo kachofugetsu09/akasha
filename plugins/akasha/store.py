@@ -229,6 +229,32 @@ class AkashaStore:
             for row in rows
         ]
 
+    # 读取单条消息的缓存 embedding。
+    def get_cached_embedding(self, *, message: "SourceMessage", model: str) -> list[float] | None:
+        from plugins.akasha.core import deserialize_f32
+        with self._lock:
+            row = self._db.execute(
+                "SELECT embedding, dim FROM akasha_embedding_cache WHERE message_id = ? AND model = ?",
+                (message.id, model),
+            ).fetchone()
+        if row is None:
+            return None
+        vec = deserialize_f32(bytes(row["embedding"]))
+        return vec.tolist()
+
+    # 批量删除缓存 embedding。
+    def delete_cached_embeddings(self, message_ids: list[str]) -> int:
+        if not message_ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" for _ in message_ids)
+            cur = self._db.execute(
+                f"DELETE FROM akasha_embedding_cache WHERE message_id IN ({placeholders})",
+                message_ids,
+            )
+            self._db.commit()
+        return cur.rowcount
+
     # 开始记录一次 Akasha 迁移。
     def start_migration_run(
         self,

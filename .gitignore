@@ -19,3 +19,5 @@ __pycache__/
 log/app.log
 
 .exp/
+# Added by CJADK
+.codex/

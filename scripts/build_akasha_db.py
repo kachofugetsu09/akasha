@@ -41,6 +41,9 @@ def _install_rebuild_stubs() -> None:
     sys.modules["core.net.http"].SharedHttpResources = type("SharedHttpResources", (), {})
     sys.modules.setdefault("memory2.embedder", types.ModuleType("memory2.embedder"))
     sys.modules["memory2.embedder"].Embedder = type("Embedder", (), {})
+    sys.modules.setdefault("session", types.ModuleType("session"))
+    sys.modules.setdefault("session.embedding_store", types.ModuleType("session.embedding_store"))
+    sys.modules["session.embedding_store"].MessageEmbeddingStore = type("MessageEmbeddingStore", (), {})
 
     core_memory = sys.modules.get("core.memory.engine") or mod("core.memory.engine")
 
