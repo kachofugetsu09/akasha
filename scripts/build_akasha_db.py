@@ -276,17 +276,34 @@ def _load_embeddings_from_cache(
     store: AkashaStore,
     model: str,
     messages: list[SourceMessage],
+    sessions_db: Path,
 ) -> tuple[dict[str, list[float]], int, int]:
     embedding_map: dict[str, list[float]] = {}
     cache_hits = 0
     cache_misses = 0
+    # 优先从 sessions.db 的 message_embeddings 表读
+    with closing(sqlite3.connect(str(sessions_db))) as sdb:
+        sdb.row_factory = sqlite3.Row
+        placeholders = ",".join("?" for _ in messages)
+        rows = sdb.execute(
+            f"SELECT message_id, embedding, dim FROM message_embeddings WHERE model=? AND message_id IN ({placeholders})",
+            [model] + [m.id for m in messages],
+        ).fetchall()
+    sessions_map = {row["message_id"]: row for row in rows}
     for message in messages:
-        embedding = store.get_cached_embedding(message=message, model=model)
-        if embedding is None:
-            cache_misses += 1
-        else:
+        row = sessions_map.get(message.id)
+        if row is not None:
+            vec = np.frombuffer(bytes(row["embedding"]), dtype=np.float32)[:row["dim"]]
+            embedding_map[message.id] = vec.tolist()
             cache_hits += 1
-            embedding_map[message.id] = embedding
+        else:
+            # fallback: akasha.db 的 embedding_cache
+            embedding = store.get_cached_embedding(message=message, model=model)
+            if embedding is None:
+                cache_misses += 1
+            else:
+                cache_hits += 1
+                embedding_map[message.id] = embedding
     return embedding_map, cache_hits, cache_misses
 
 
@@ -368,6 +385,7 @@ def _run() -> MigrationStats:
         replay_messages = [message for turn in replay_turns for message in turn]
         embedding_map, cache_hits, cache_misses = _load_embeddings_from_cache(
             store=store,
+            sessions_db=sessions_db,
             model=embedding_model,
             messages=replay_messages,
         )

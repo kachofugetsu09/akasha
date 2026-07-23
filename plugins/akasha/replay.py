@@ -25,6 +25,7 @@ from plugins.akasha.core import (
     DENSE_SEED_LIMIT,
     SourceMessage,
     activation_edge_updates,
+    mi_converge,
     local_residual,
     activation_updates,
     compute_candidates_from_snapshot,
@@ -215,24 +216,12 @@ class AkashaReplayRuntime:
             config=self._core_config,
             source_cursor=self._source_cursor,
             soft_recall=False,
-            return_limit=budget.activation_k,
+            return_limit=budget.activation_k,  # 限制建边量，保持图稀疏
             graph_seed_keys=graph_seed_keys,
         )
-        display_limit = max(
-            24,
-            max(budget.ripple_k, CONTEXT_QUERY_LIMIT) * 3,
-        )
-        ripple_items, _, trace = compute_candidates_from_snapshot(
-            query_text,
-            query_vec,
-            snapshot,
-            now_ts,
-            config=self._core_config,
-            source_cursor=self._source_cursor,
-            soft_recall=True,
-            return_limit=display_limit,
-            graph_seed_keys=graph_seed_keys,
-        )
+        # ripple = activation 的全部候选，展示时和 dense 去重
+        # 不再独立跑 soft_recall——统一筛选标准，保证质量
+        ripple_items = candidates
         self._store.update_activation_batch(activation_updates(candidates, nodes, now_ts))
         return ReplayActivation(candidates, dense_items, ripple_items, trace)
 
@@ -297,6 +286,9 @@ class AkashaReplayRuntime:
         query_vec = np.array(embedding, dtype=np.float32)
         return local_residual(query_vec, prior)
 
+
+
+
     def _write_query_log(
         self,
         message: SourceMessage,
@@ -315,12 +307,20 @@ class AkashaReplayRuntime:
         )
         dense_keys = {card.key for card in dense_cards}
         dense_pairs = {_card_dedupe_key(card) for card in dense_cards}
+        # MI 收敛 + hub 惩罚：自适应决定 ripple 数量
+        ripple_candidates = [item for item in activation.ripple_items if item.key not in dense_keys]
+        emb_cache = {}
+        for item in ripple_candidates:
+            node = self._store.get_node(item.key)
+            if node is not None and node.embedding.size > 0:
+                emb_cache[item.key] = node.embedding / (np.linalg.norm(node.embedding) + 1e-9)
+        ripple_converged = mi_converge(ripple_candidates, emb_cache)
         ripple_cards = _cards_from_candidates(
             self._source_db_path,
             self._config,
-            [item for item in activation.ripple_items if item.key not in dense_keys],
+            ripple_converged,
             lane="ripple",
-            limit=budget.ripple_k,
+            limit=999,
             skip_pairs=dense_pairs,
         )
         text_block = _format_context_block(

@@ -522,6 +522,41 @@ def normalize(vector: np.ndarray) -> np.ndarray:
     return vector / norm if norm > 0 else vector
 
 
+def mi_converge(items, emb_cache):
+    """边际信息增量收敛：MI = adjusted_score x (1 - max_sim_to_kept)"""
+    if not items:
+        return []
+    sorted_items = sorted(items, key=lambda x: -x.score)
+
+    hub_factors = {}
+    for it in sorted_items:
+        ratio = it.direct / it.score if it.score > 0.01 else 1.0
+        hub_factors[it.key] = min(1.0, max(0.1, ratio / 0.3))
+
+    sorted_items.sort(key=lambda x: -(x.score * hub_factors.get(x.key, 1.0)))
+
+    kept = [sorted_items[0]]
+    kept_vecs = []
+    v0 = emb_cache.get(sorted_items[0].key)
+    if v0 is not None:
+        kept_vecs.append(v0)
+    top_mi = sorted_items[0].score * hub_factors.get(sorted_items[0].key, 1.0)
+    theta = top_mi * 0.03
+
+    for it in sorted_items[1:]:
+        vec = emb_cache.get(it.key)
+        max_sim = 0.0
+        if vec is not None and kept_vecs:
+            max_sim = max(float(np.dot(vec, v)) for v in kept_vecs)
+        adj_score = it.score * hub_factors.get(it.key, 1.0)
+        mi = adj_score * (1 - max(0.0, max_sim))
+        if mi >= theta:
+            kept.append(it)
+            if vec is not None:
+                kept_vecs.append(vec)
+    return kept
+
+
 def causal_salience(
     embedding: list[float] | np.ndarray,
     prior_sum: np.ndarray | None,
@@ -1314,8 +1349,10 @@ def score_candidates(
             )
     candidates.sort(key=lambda item: item.score, reverse=True)
     suppressed.sort(key=lambda item: item.score, reverse=True)
-    limit = return_limit or DEFAULT_ACTIVATION_LIMIT
-    return candidates[:limit], suppressed[:limit]
+    # return_limit=None 时不截断，由 activation_threshold 自然筛选
+    if return_limit is not None:
+        return candidates[:return_limit], suppressed[:return_limit]
+    return candidates, suppressed
 
 
 def graph_expand_candidates(

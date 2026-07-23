@@ -315,10 +315,9 @@ class AkashaMemoryEngine:
         # 4. dense 高原越强，左脑少展示重复共振，右脑多展开。
         budget = result.budget
         dense_limit = budget.dense_k
-        ripple_limit = budget.ripple_k
+        ripple_limit = 999  # MI 收敛在 _cards_from_keys 后由展示层处理
         if request.intent != "context":
             dense_limit = min(request.limit, dense_limit)
-            ripple_limit = min(request.limit, ripple_limit)
         dense_cards = self._cards_from_keys(
             [(item.key, item.score, "dense", _candidate_signals(item)) for item in result.dense_items],
             limit=dense_limit,
@@ -326,13 +325,25 @@ class AkashaMemoryEngine:
         )
         dense_keys = {card.key for card in dense_cards}
         dense_pairs = {_card_dedupe_key(card) for card in dense_cards}
+        # MI 收敛 + hub 惩罚
+        ripple_raw = [
+            (item.key, item.score, "ripple", _candidate_signals(item))
+            for item in result.ripple_items
+            if item.key not in dense_keys
+        ]
+        # 构建 emb_cache
+        emb_cache = {}
+        for item in result.ripple_items:
+            if item.key not in dense_keys:
+                node = self._store.get_node(item.key)
+                if node is not None and node.embedding.size > 0:
+                    emb_cache[item.key] = node.embedding / (np.linalg.norm(node.embedding) + 1e-9)
+        # MI 收敛需要 dict 格式的候选
+        ripple_dicts = [item for item in result.ripple_items if item.key not in dense_keys]
+        ripple_converged = _mi_converge(ripple_dicts, emb_cache)
         ripple_cards = self._cards_from_keys(
-            [
-                (item.key, item.score, "ripple", _candidate_signals(item))
-                for item in result.ripple_items
-                if item.key not in dense_keys
-            ],
-            limit=ripple_limit,
+            [(item.key, item.score, "ripple", _candidate_signals(item)) for item in ripple_converged],
+            limit=999,
             skip_pairs=dense_pairs,
             cutoff=datetime.fromtimestamp(now_ts, timezone.utc).isoformat(),
         )
@@ -593,7 +604,7 @@ class AkashaMemoryEngine:
                 snapshot,
                 limit=DENSE_SEED_LIMIT,
             )
-            activation_items, _, _ = _compute_candidates_from_snapshot(
+            activation_items, _, trace = _compute_candidates_from_snapshot(
                 query,
                 query_vec,
                 now_ts,
@@ -601,24 +612,12 @@ class AkashaMemoryEngine:
                 config=self._akasha_config,
                 source_cursor=source_cursor,
                 soft_recall=False,
-                return_limit=budget.activation_k,
+                return_limit=budget.activation_k,  # 限制建边量，保持图稀疏
                 graph_seed_keys=graph_seed_keys,
             )
-            display_limit = max(
-                24,
-                max(budget.ripple_k, request.limit) * 3,
-            )
-            ripple_items, _, trace = _compute_candidates_from_snapshot(
-                query,
-                query_vec,
-                now_ts,
-                snapshot=snapshot,
-                config=self._akasha_config,
-                source_cursor=source_cursor,
-                soft_recall=True,
-                return_limit=display_limit,
-                graph_seed_keys=graph_seed_keys,
-            )
+            # ripple = activation 全部候选，展示时和 dense 去重
+            # 不再独立跑 soft_recall——统一筛选标准，保证线上和重放一致
+            ripple_items = activation_items
         finally:
             if source_db is not None:
                 source_db.close()
