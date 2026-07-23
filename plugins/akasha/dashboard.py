@@ -24,7 +24,6 @@ from plugins.akasha.graph_snapshot import (
     graph_from_edges,
     layout_graph,
     load_snapshot,
-    node_radius,
     normalize_positions,
     normalized_embedding,
     read_graph_signature,
@@ -227,16 +226,12 @@ class AkashaGraphReader:
         colors, legend = community_legend(graph, comms, node_to_comm, nodes_by_key, texts)
         node_list = [str(node) for node in graph.nodes()]
         node_id = {key: index for index, key in enumerate(node_list)}
-        saliences = [as_float(nodes_by_key[key]["salience"]) for key in node_list]
-        min_sal = min(saliences) if saliences else 0.0
-        max_sal = max(saliences) if saliences else 0.0
         coords = normalize_positions(pos)
         payload_nodes: list[dict[str, object]] = []
         for key in node_list:
             row = nodes_by_key[key]
             meta = node_meta.get(key, {})
             comm = node_to_comm.get(key, 0)
-            salience = as_float(row["salience"])
             x, y = coords.get(key, (500.0, 500.0))
             payload_nodes.append({
                 "id": key,
@@ -245,11 +240,11 @@ class AkashaGraphReader:
                 "turn_seq": row["turn_seq"],
                 "x": x,
                 "y": y,
-                "r": node_radius(salience, min_sal, max_sal),
+                "r": 5.0,
                 "c": colors.get(comm, "#7a7f8a"),
                 "g": comm,
                 "t": clip(texts.get(key, ""), 120),
-                "salience": salience,
+                "salience": 1.0,
                 "strength": as_float(row["strength"]),
                 "resource": as_float(row["resource"]),
                 "recall_count": as_int(row["recall_count"]),
@@ -281,7 +276,7 @@ class AkashaGraphReader:
                 placeholders = ",".join("?" for _ in part)
                 rows = self._store.db.execute(
                     f"""
-                    SELECT key, anchor_id, session_key, turn_seq, salience, strength,
+                    SELECT key, anchor_id, session_key, turn_seq, strength,
                            resource, recall_count, embedding
                     FROM akasha_nodes
                     WHERE key IN ({placeholders})
@@ -294,7 +289,7 @@ class AkashaGraphReader:
                         "anchor_id": str(row["anchor_id"]),
                         "session_key": str(row["session_key"]),
                         "turn_seq": int(row["turn_seq"] or 0),
-                        "salience": float(row["salience"] or 0.0),
+                        "salience": 1.0,
                         "strength": float(row["strength"] or 0.0),
                         "resource": float(row["resource"] or 0.0),
                         "recall_count": int(row["recall_count"] or 0),

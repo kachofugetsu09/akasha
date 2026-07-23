@@ -145,7 +145,7 @@ def test_dense_message_candidates_vectorized_preserves_turn_ranking() -> None:
             session_key="s",
             turn_seq=0,
             first_ts_unix=T0,
-            salience=0.0,
+            salience=1.0,
             strength=0.0,
             resource=1.0,
             recall_count=0,
@@ -161,7 +161,7 @@ def test_dense_message_candidates_vectorized_preserves_turn_ranking() -> None:
             session_key="s",
             turn_seq=2,
             first_ts_unix=T0,
-            salience=0.0,
+            salience=1.0,
             strength=0.0,
             resource=1.0,
             recall_count=0,
@@ -177,7 +177,7 @@ def test_dense_message_candidates_vectorized_preserves_turn_ranking() -> None:
             session_key="s",
             turn_seq=4,
             first_ts_unix=T0,
-            salience=0.0,
+            salience=1.0,
             strength=0.0,
             resource=1.0,
             recall_count=0,
@@ -461,7 +461,7 @@ def test_store_and_runtime_cache_apply_same_edge_decay(tmp_path: Path) -> None:
     assert engine._edges_meta[("s:0", "s:2")] == persisted_meta[("s:0", "s:2")]
 
 
-def test_store_persists_causal_salience_state(tmp_path: Path) -> None:
+def test_store_persists_uniform_salience(tmp_path: Path) -> None:
     store = AkashaStore(tmp_path / "akasha.db")
     try:
         store.upsert_message_node(
@@ -481,14 +481,14 @@ def test_store_persists_causal_salience_state(tmp_path: Path) -> None:
             core.SourceMessage("m14", "s", 14, "user", "third", T0_ISO),
             [1.0, 0.0],
         )
-        assert _node_salience(store, "s:10") == pytest.approx(0.0)
+        assert _node_salience(store, "s:10") == pytest.approx(1.0)
         assert _node_salience(store, "s:12") == pytest.approx(1.0)
-        assert _node_salience(store, "s:14") == pytest.approx(0.585786, abs=1e-6)
+        assert _node_salience(store, "s:14") == pytest.approx(1.0)
     finally:
         store.close()
 
 
-def test_replay_and_online_write_same_causal_salience(tmp_path: Path) -> None:
+def test_replay_and_online_write_same_uniform_salience(tmp_path: Path) -> None:
     _init_sessions_db(tmp_path / "sessions.db")
     online_store = AkashaStore(tmp_path / "online.db")
     replay_store = AkashaStore(tmp_path / "replay.db")
@@ -521,6 +521,9 @@ def test_replay_and_online_write_same_causal_salience(tmp_path: Path) -> None:
         assert _node_salience(online_store, "s:14") == pytest.approx(
             _node_salience(replay_store, "s:14")
         )
+        assert _node_salience(online_store, "s:10") == pytest.approx(1.0)
+        assert _node_salience(online_store, "s:12") == pytest.approx(1.0)
+        assert _node_salience(online_store, "s:14") == pytest.approx(1.0)
     finally:
         online_store.close()
         replay_store.close()

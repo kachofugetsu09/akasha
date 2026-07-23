@@ -218,7 +218,7 @@ def _load_nodes(
         placeholders = ",".join("?" for _ in part)
         rows = db.execute(
             f"""
-            SELECT key, anchor_id, session_key, turn_seq, salience, strength,
+            SELECT key, anchor_id, session_key, turn_seq, strength,
                    resource, recall_count, embedding
             FROM akasha_nodes
             WHERE key IN ({placeholders})
@@ -231,7 +231,7 @@ def _load_nodes(
                 "anchor_id": str(row["anchor_id"]),
                 "session_key": str(row["session_key"]),
                 "turn_seq": int(row["turn_seq"] or 0),
-                "salience": float(row["salience"] or 0.0),
+                "salience": 1.0,
                 "strength": float(row["strength"] or 0.0),
                 "resource": float(row["resource"] or 0.0),
                 "recall_count": int(row["recall_count"] or 0),
@@ -445,14 +445,10 @@ def _payload_nodes(
     colors: dict[int, str],
 ) -> list[dict[str, object]]:
     node_list = sorted(nodes_by_key, key=lambda key: (node_to_comm.get(key, 0), key))
-    saliences = [_as_float(nodes_by_key[key]["salience"]) for key in node_list]
-    min_sal = min(saliences) if saliences else 0.0
-    max_sal = max(saliences) if saliences else 0.0
     result: list[dict[str, object]] = []
     for key in node_list:
         row = nodes_by_key[key]
         comm = node_to_comm.get(key, 0)
-        salience = _as_float(row["salience"])
         x, y = coords.get(key, (500.0, 500.0))
         result.append({
             "id": key,
@@ -461,11 +457,11 @@ def _payload_nodes(
             "turn_seq": row["turn_seq"],
             "x": x,
             "y": y,
-            "r": _node_radius(salience, min_sal, max_sal),
+            "r": 5.0,
             "c": colors.get(comm, "#7a7f8a"),
             "g": comm,
             "t": _clip(texts.get(key, ""), 120),
-            "salience": salience,
+            "salience": 1.0,
             "strength": _as_float(row["strength"]),
             "resource": _as_float(row["resource"]),
             "recall_count": _as_int(row["recall_count"]),
@@ -543,8 +539,7 @@ def _community_legend(
             )
             total = float(graph.degree(node, weight="weight") or 0.0)
             purity = internal / (total + 1e-9)
-            salience = max(_as_float(nodes_by_key[node]["salience"]), 0.1)
-            scored.append((internal * purity * salience, _clip(text, 24)))
+            scored.append((internal * purity, _clip(text, 24)))
         scored.sort(key=lambda item: item[0], reverse=True)
         legend.append({
             "c": colors[comm_id],
@@ -618,10 +613,6 @@ def _community_color(index: int) -> str:
     return f"hsl({hue},{saturation}%,{lightness}%)"
 
 
-def _node_radius(salience: float, min_sal: float, max_sal: float) -> float:
-    return round(2.5 + 6.5 * ((salience - min_sal) / (max_sal - min_sal + 1e-9)), 1)
-
-
 def _as_float(value: object) -> float:
     if isinstance(value, int | float):
         return float(value)
@@ -693,6 +684,5 @@ community_legend = _community_legend
 dense_sim = _dense_sim
 graph_from_edges = _graph_from_edges
 layout_graph = _layout_graph
-node_radius = _node_radius
 normalize_positions = _normalize_positions
 normalized_embedding = _normalized_embedding

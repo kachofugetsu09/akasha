@@ -39,20 +39,14 @@ DEFAULT_REINFORCE_BOOST = 3.0
 # β 是机制常数：promiscuous hub 活动次数多 → 罕被重强化的边被反复 ×(1-β) 磨到≈0；
 # 真正反复共激活的边扛得住；低活动典型节点几乎不动（activity-dependent）。
 HETERO_DEPRESSION_RATE = 0.05
-# 新事件初始 strength：编码即峰值（Ebbinghaus / ACT-R / early-LTP）
-# initial_strength = STRENGTH_CAP × (BASE + SALIENCE_BONUS · σ)
-INITIAL_STRENGTH_BASE = 0.70
-INITIAL_STRENGTH_SALIENCE_BONUS = 0.30
-SALIENCE_CENTROID_SCALE = 2.0
 DENSE_SEED_LIMIT = 10
 DENSE_CANDIDATE_LIMIT = 20
 DEFAULT_ACTIVATION_LIMIT = 8
 
 
-def initial_strength(salience: float) -> float:
-    """新节点 encoding 时的 strength。高显著度事件起步更接近 cap。"""
-    s = max(0.0, min(1.0, salience))
-    return STRENGTH_CAP * (INITIAL_STRENGTH_BASE + INITIAL_STRENGTH_SALIENCE_BONUS * s)
+def initial_strength() -> float:
+    """Initialize every new node at the same peak strength."""
+    return STRENGTH_CAP
 
 
 def reinforce_boost_from_payload(
@@ -557,30 +551,6 @@ def mi_converge(items, emb_cache):
     return kept
 
 
-def causal_salience(
-    embedding: list[float] | np.ndarray,
-    prior_sum: np.ndarray | None,
-    prior_count: int,
-) -> float:
-    """只用当前消息之前的全局重心计算 salience。"""
-    if prior_sum is None or prior_count <= 0:
-        return 0.0
-    vector = normalize(np.array(embedding, dtype=np.float32))
-    centroid = normalize(prior_sum / float(prior_count))
-    value = (1.0 - float(np.dot(vector, centroid))) * SALIENCE_CENTROID_SCALE
-    return min(1.0, max(0.0, value))
-
-
-def advance_salience_state(
-    prior_sum: np.ndarray | None,
-    prior_count: int,
-    embedding: list[float] | np.ndarray,
-) -> tuple[np.ndarray, int]:
-    vector = normalize(np.array(embedding, dtype=np.float32))
-    total = vector.copy() if prior_sum is None else prior_sum + vector
-    return total, prior_count + 1
-
-
 def _best_device() -> str:
     """选择最佳推理设备。"""
     try:
@@ -707,7 +677,7 @@ def load_state(
     cursor = db.cursor()
     _ = cursor.execute(
         """
-        SELECT key, anchor_id, session_key, turn_seq, first_ts_unix, salience,
+        SELECT key, anchor_id, session_key, turn_seq, first_ts_unix,
                strength, resource, recall_count, last_activated_ts,
                last_strength_ts, last_resource_ts, embedding, emb_count
         FROM akasha_nodes
@@ -717,7 +687,7 @@ def load_state(
     for row in cursor.fetchall():
         (
             key, anchor_id, session_key, turn_seq, first_ts_unix,
-            salience, strength, resource, recall_count,
+            strength, resource, recall_count,
             last_activated_ts, last_strength_ts, last_resource_ts,
             embedding_blob, emb_count,
         ) = row
@@ -730,7 +700,7 @@ def load_state(
             session_key=session_key,
             turn_seq=turn_seq,
             first_ts_unix=first_ts_unix,
-            salience=salience,
+            salience=1.0,
             strength=strength,
             resource=resource,
             recall_count=recall_count,
@@ -1010,7 +980,7 @@ def seed_pool(
     config: CoreConfig,
     source_cursor: sqlite3.Cursor | None,
 ) -> tuple[dict[str, str], dict[str, float]]:
-    """Dense / FTS / BlackHole 三路种子选择。"""
+    """Select Dense and FTS seeds with their initial energy."""
     ranked = sorted(direct_scores.items(), key=lambda item: item[1], reverse=True)
     seed_sources: dict[str, str] = {}
     seed_energy: dict[str, float] = {}
@@ -1077,17 +1047,6 @@ def seed_pool(
                         seed_energy[key] = 1.0
                         fts_only_count += 1
 
-    blackhole_hits: list[tuple[str, float]] = []
-    for key, node in nodes.items():
-        if node.salience <= 0.8 or key in seed_sources:
-            continue
-        score = direct_scores.get(key, 0.0)
-        if score > 0.60:
-            blackhole_hits.append((key, score))
-    for key, _ in sorted(blackhole_hits, key=lambda item: item[1], reverse=True)[:5]:
-        seed_sources[key] = "BlackHole"
-        seed_energy[key] = 1.0
-
     return seed_sources, seed_energy
 
 
@@ -1100,14 +1059,14 @@ def state_array(
     fan: dict[str, int],
     now_ts: float,
 ) -> np.ndarray:
-    """计算节点状态权重（salience + 长期强度 + 短期资源 + fan 惩罚）。"""
+    """计算节点状态权重（长期强度 + 短期资源 + fan 惩罚）。"""
     values = np.zeros(len(keys), dtype=np.float32)
     for index, key in enumerate(keys):
         node = nodes[key]
         long_score = min(1.0, decayed_strength(node, now_ts) / STRENGTH_CAP)
         resource = recover_resource(node, now_ts)
         values[index] = (
-            math.exp(1.4 * node.salience + 1.0 * long_score)
+            math.exp(long_score)
             * resource
             / math.sqrt(1.0 + fan.get(key, 0))
         )
@@ -1267,15 +1226,12 @@ def score_candidates(
         weak = min(ripple_term, direct_term)
         content_base = strong + weak * max(0.0, 1.0 - strong)
 
-        # 每个状态信号都是乘法 gain factor，signal=0 时 gain=1（不影响）
-        # signal 高时 gain > 1（multiplicative 放大）
-        gain_salience = 1.0 + 0.8 * node.salience           # σ ∈ [0,1] → gain ∈ [1, 1.8]
-        gain_long     = 1.0 + 0.6 * long_score              # long ∈ [0,1] → gain ∈ [1, 1.6]
-        gain_edge     = 1.0 + 0.5 * min(1.0, edge_value)    # edge → gain ∈ [1, 1.5]
+        # 长期强度和边权作为乘法 gain，signal=0 时不影响。
+        gain_long = 1.0 + 0.6 * long_score
+        gain_edge = 1.0 + 0.5 * min(1.0, edge_value)
 
         score = (
             content_base
-            * gain_salience
             * gain_long
             * gain_edge
         ) * resource * hop_penalty * user_penalty / fan_penalty

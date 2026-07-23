@@ -12,9 +12,7 @@ import numpy as np
 from plugins.akasha.core import (
     AkashaNode, ActivationUpdate, EdgeUpdate, ActivationEventRow,
     SourceMessage, turn_key, serialize_f32, deserialize_f32, parse_ts_unix,
-    advance_salience_state,
     bounded_add,
-    causal_salience,
     effective_edge_weight,
     heterosynaptic_depression,
     initial_strength,
@@ -106,12 +104,6 @@ CREATE TABLE IF NOT EXISTS akasha_embedding_cache (
 );
 CREATE INDEX IF NOT EXISTS ix_akasha_embedding_cache_hash
     ON akasha_embedding_cache (content_hash, model);
-CREATE TABLE IF NOT EXISTS akasha_salience_state (
-    key         TEXT PRIMARY KEY,
-    vector_sum BLOB NOT NULL,
-    count       INTEGER NOT NULL,
-    updated_at  TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS akasha_migration_runs (
     id               TEXT PRIMARY KEY,
     source_db_path   TEXT NOT NULL,
@@ -367,21 +359,12 @@ class AkashaStore:
 
         # 2. 新 turn 直接写入；已有 turn 用均值更新 embedding，并保留 user 作为 anchor。
         with self._lock:
-            prior_sum, prior_count = self._load_salience_state_locked()
-            salience = (
-                causal_salience(vector, prior_sum, prior_count)
-                if message.salience is None
-                else min(1.0, max(0.0, float(message.salience)))
-            )
-            next_sum, next_count = advance_salience_state(prior_sum, prior_count, vector)
             row = self._db.execute(
                 "SELECT * FROM akasha_nodes WHERE key = ?",
                 (key,),
             ).fetchone()
             if row is None:
-                # 编码即峰值：strength 按 salience 初始化为接近 cap 的值
-                # 对应 Ebbinghaus 遗忘曲线起点 + ACT-R 初次激活高 base-level
-                init_str = initial_strength(salience)
+                init_str = initial_strength()
                 # 新节点的 last_*_ts 设为 first_ts_unix（编码即"被激活"那一刻）
                 _ = self._db.execute(
                     """
@@ -398,7 +381,7 @@ class AkashaStore:
                         session_key,
                         turn_seq,
                         ts_unix,
-                        salience,
+                        1.0,
                         init_str,
                         ts_unix,
                         ts_unix,
@@ -408,7 +391,6 @@ class AkashaStore:
                         now,
                     ),
                 )
-                self._write_salience_state_locked(next_sum, next_count, now)
                 self._db.commit()
                 return key
 
@@ -428,44 +410,15 @@ class AkashaStore:
                 """,
                 (
                     anchor_id,
-                    max(float(row["salience"] or 0.0), salience),
+                    1.0,
                     serialize_f32(merged),
                     old_count + 1,
                     now,
                     key,
                 ),
             )
-            self._write_salience_state_locked(next_sum, next_count, now)
             self._db.commit()
         return key
-
-    def _load_salience_state_locked(self) -> tuple[np.ndarray | None, int]:
-        row = self._db.execute(
-            "SELECT vector_sum, count FROM akasha_salience_state WHERE key = 'global'"
-        ).fetchone()
-        if row is None:
-            return None, 0
-        vector_sum = deserialize_f32(row["vector_sum"])
-        count = int(row["count"] or 0)
-        return (vector_sum if vector_sum.size else None), count
-
-    def _write_salience_state_locked(
-        self,
-        vector_sum: np.ndarray,
-        count: int,
-        now: str,
-    ) -> None:
-        _ = self._db.execute(
-            """
-            INSERT INTO akasha_salience_state (key, vector_sum, count, updated_at)
-            VALUES ('global', ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                vector_sum = excluded.vector_sum,
-                count = excluded.count,
-                updated_at = excluded.updated_at
-            """,
-            (serialize_f32(vector_sum), count, now),
-        )
 
     # 读取全部 turn 节点。
     def list_nodes(self) -> list[AkashaNode]:
@@ -866,7 +819,7 @@ def _row_to_node(row: sqlite3.Row) -> AkashaNode | None:
         session_key=str(row["session_key"]),
         turn_seq=int(row["turn_seq"]),
         first_ts_unix=float(row["first_ts_unix"] or 0.0),
-        salience=float(row["salience"] or 0.0),
+        salience=1.0,
         strength=float(row["strength"] or 0.0),
         resource=float(row["resource"] or 1.0),
         recall_count=int(row["recall_count"] or 0),

@@ -18,7 +18,7 @@ from dataclasses import replace
 import numpy as np
 
 from plugins.akasha.core import (
-    AkashaNode, EDGE_DECAY_TAU, advance_salience_state, causal_salience,
+    AkashaNode, EDGE_DECAY_TAU,
     effective_edge_weight, bounded_add, initial_strength, normalize, parse_ts_unix, turn_key,
 )
 
@@ -29,8 +29,6 @@ class MemoryStore:
         self._edges: dict[tuple[str, str], float] = {}
         self._meta: dict[tuple[str, str], float] = {}
         self._cocount: dict[tuple[str, str], int] = {}
-        self._csum: np.ndarray | None = None
-        self._ccount: int = 0
         self._frozen = False
         # 增量结构
         self._ebs: dict[str, dict[str, float]] = {}      # edges_by_src
@@ -80,18 +78,11 @@ class MemoryStore:
         session_key, turn_seq, key = turn_key(message.session_key, message.seq, message.role)
         vector = normalize(np.array(embedding, dtype=np.float32))
         ts_unix = parse_ts_unix(message.ts)
-        prior_sum, prior_count = self._csum, self._ccount
-        salience = (
-            causal_salience(vector, prior_sum, prior_count)
-            if getattr(message, "salience", None) is None
-            else min(1.0, max(0.0, float(message.salience)))
-        )
-        self._csum, self._ccount = advance_salience_state(prior_sum, prior_count, vector)
         node = self._nodes.get(key)
         if node is None:
             self._nodes[key] = AkashaNode(
                 key=key, anchor_id=message.id, session_key=session_key, turn_seq=turn_seq,
-                first_ts_unix=ts_unix, salience=salience, strength=initial_strength(salience),
+                first_ts_unix=ts_unix, salience=1.0, strength=initial_strength(),
                 resource=1.0, recall_count=0, last_activated_ts=ts_unix,
                 last_strength_ts=ts_unix, last_resource_ts=ts_unix, embedding=vector, emb_count=1)
         else:
@@ -99,7 +90,7 @@ class MemoryStore:
             merged = normalize(node.embedding * old_count + vector)
             anchor = message.id if message.role == "user" else node.anchor_id
             self._nodes[key] = replace(node, anchor_id=anchor,
-                                       salience=max(node.salience, salience),
+                                       salience=1.0,
                                        embedding=merged, emb_count=old_count + 1)
         return key
 

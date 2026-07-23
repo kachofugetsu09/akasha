@@ -231,7 +231,6 @@
 .ai-src-dense    { background: rgba(59, 130, 246, 0.15); color: #60A5FA; }
 .ai-src-densefb  { background: rgba(59, 130, 246, 0.1); color: #3B82F6; }
 .ai-src-fts      { background: rgba(245, 158, 11, 0.15); color: #FBBF24; }
-.ai-src-blackhole{ background: rgba(168, 85, 247, 0.15); color: #C084FC; }
 .ai-src-expanded { background: rgba(34, 197, 94, 0.15); color: #4ADE80; }
 .ai-src-bridge   { background: rgba(236, 72, 153, 0.15); color: #F472B6; }
 .ai-src-other    { background: rgba(255, 255, 255, 0.1); color: #FFF; }
@@ -590,6 +589,5 @@
   font-size: 14px;
   font-weight: 600;
 }
-
 
 

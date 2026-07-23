@@ -1,10 +1,10 @@
 """dump_to_db —— 把内存 MemoryStore 一次性批量落进已开的 AkashaStore（sqlite）。
 
 列与序列化严格对齐 store.py 的慢路写法：
-  * embedding / salience vector_sum 用 core.serialize_f32
+  * embedding 用 core.serialize_f32
   * created_at/updated_at 用 _now_iso（与慢路 store._now_iso 同语义）
   * 各表 VALUES 顺序对齐 store.py 的 INSERT
-reset_schema 只清 5 张图表(nodes/edges/salience_state/query_log/activation_events)，
+reset_schema 清理图表和旧 salience_state，
 保留 migration_runs / source_session_snapshot。复用调用方已开的连接（单连接）。
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ def dump_to_db(store: AkashaStore, mem) -> dict[str, int]:
         node_rows = [
             (
                 n.key, n.anchor_id, n.session_key, n.turn_seq, n.first_ts_unix,
-                n.salience, n.strength, n.resource, n.recall_count,
+                1.0, n.strength, n.resource, n.recall_count,
                 n.last_activated_ts, n.last_strength_ts, n.last_resource_ts,
                 serialize_f32(np.asarray(n.embedding, dtype=np.float32)), n.emb_count, now, now,
             )
@@ -57,15 +57,6 @@ def dump_to_db(store: AkashaStore, mem) -> dict[str, int]:
             for (s, d), w in edges.items()
         ]
         db.executemany("INSERT INTO akasha_edges VALUES (?, ?, ?, ?, ?)", edge_rows)
-
-        csum = mem._csum  # pyright: ignore[reportPrivateUsage]
-        if csum is not None:
-            db.execute(
-                "INSERT INTO akasha_salience_state (key, vector_sum, count, updated_at) "
-                "VALUES ('global', ?, ?, ?)",
-                (serialize_f32(np.asarray(csum, dtype=np.float32)),
-                 int(mem._ccount), now),  # pyright: ignore[reportPrivateUsage]
-            )
 
         if ql:
             db.executemany(

@@ -8,7 +8,7 @@
 - **`sessions.db`** = 唯一真相源（原始 user/assistant 消息，不动）。
   - `message_embeddings` —— 公共消息 embedding 缓存，供 Akasha、Proactive 等消费者复用
 - **`akasha.db`** = 在真相之上的**索引 + 图**，由重放 `sessions.db` 算出来：
-  - `akasha_nodes` / `akasha_edges` / `akasha_salience_state` —— 图本体（重建会清掉重算）
+  - `akasha_nodes` / `akasha_edges` —— 图本体（重建会清掉重算）
   - `akasha_query_log` / `akasha_activation_events` —— 诊断（重建重算）
   - `akasha_embedding_cache` —— 旧缓存，只在升级时作为一次性迁移来源
   - `fts_token_idf` —— FTS 稀有词的 IDF 表（FTS 种子用，单独一步建）

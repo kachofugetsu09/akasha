@@ -810,7 +810,7 @@ class AkashaMemoryEngine:
             ) > now_ts:
                 node = replace(
                     node,
-                    strength=initial_strength(node.salience),
+                    strength=initial_strength(),
                     resource=1.0,
                     recall_count=0,
                     last_activated_ts=node.first_ts_unix,

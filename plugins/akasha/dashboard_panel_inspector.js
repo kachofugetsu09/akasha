@@ -10,7 +10,6 @@ function ai_sourceTag(source) {
     Dense: "ai-src-dense",
     "Dense(FB)": "ai-src-densefb",
     FTS: "ai-src-fts",
-    BlackHole: "ai-src-blackhole",
     Bridge: "ai-src-bridge"
   }[source] ?? "ai-src-other";
   return `<span class="ai-tag ${cls}">${escapeHtml(source)}</span>`;
