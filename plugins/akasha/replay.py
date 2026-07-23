@@ -561,4 +561,4 @@ def _turn_messages(
 def _clip_text(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
-    return text[:limit].rstrip() + "..."
+    return text[:limit].rstrip()

@@ -10,7 +10,7 @@ from typing import cast
 class AkashaConfig:
     db_path: str = ""
     inject_max_chars: int = 6000
-    assistant_preview_chars: int = 0
+    assistant_preview_chars: int = 50
     dense_seed_threshold: float = 0.675
     nearby_time_seconds: int = 1800
     nearby_dense_threshold: float = 0.28
@@ -33,7 +33,7 @@ def load_akasha_config(
     return AkashaConfig(
         db_path=str(payload.get("db_path") or ""),
         inject_max_chars=_int_value(payload.get("inject_max_chars"), 6000),
-        assistant_preview_chars=_int_value(payload.get("assistant_preview_chars"), 0),
+        assistant_preview_chars=_int_value(payload.get("assistant_preview_chars"), 50),
         dense_seed_threshold=_float_value(payload.get("dense_seed_threshold"), 0.675),
         nearby_time_seconds=_int_value(payload.get("nearby_time_seconds"), 1800),
         nearby_dense_threshold=_float_value(payload.get("nearby_dense_threshold"), 0.28),

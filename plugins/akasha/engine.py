@@ -1457,7 +1457,7 @@ def _clip_assistant(text: str, limit: int) -> str:
     limit = max(0, int(limit))
     if limit <= 0 or len(clean) <= limit:
         return clean
-    return clean[:limit].rstrip() + "..."
+    return clean[:limit].rstrip()
 
 
 # 归一化文本，避免多空格造成同文候选无法去重。

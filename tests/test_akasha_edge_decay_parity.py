@@ -439,7 +439,7 @@ def test_query_log_content_loader_allows_empty_user_message(tmp_path: Path) -> N
         )
 
     assert user_message == ""
-    assert assistant_preview == "assistant..."
+    assert assistant_preview == "assistant"
 
 
 def test_store_and_runtime_cache_apply_same_edge_decay(tmp_path: Path) -> None:

@@ -137,6 +137,12 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="直接指定 embedding 模型名（缓存命中键用）；给定后不读 --config，免依赖 agent 包",
     )
+    _ = parser.add_argument(
+        "--assistant-preview-chars",
+        type=int,
+        default=None,
+        help="覆盖助手回复预览长度；0 表示不截断",
+    )
     return parser.parse_args()
 
 
@@ -144,12 +150,16 @@ def _parse_args() -> argparse.Namespace:
 def _load_script_config(
     *,
     db_path: str,
+    assistant_preview_chars: int | None,
 ) -> AkashaConfig:
     # 1. 插件配置仍从 plugins/akasha/config.local.toml 读取。
     config = load_akasha_config()
+    updates: dict[str, object] = {}
     if db_path.strip():
-        return replace(config, db_path=db_path)
-    return config
+        updates["db_path"] = db_path
+    if assistant_preview_chars is not None:
+        updates["assistant_preview_chars"] = assistant_preview_chars
+    return replace(config, **updates) if updates else config
 
 
 # 读取 sessions.db 中的原始消息。
@@ -338,7 +348,10 @@ def _run() -> MigrationStats:
     args = _parse_args()
     workspace = Path(str(args.workspace)).expanduser()
     sessions_db = Path(str(args.sessions_db)).expanduser() if args.sessions_db else workspace / "sessions.db"
-    akasha_config = _load_script_config(db_path=str(args.db_path or ""))
+    akasha_config = _load_script_config(
+        db_path=str(args.db_path or ""),
+        assistant_preview_chars=args.assistant_preview_chars,
+    )
     db_path = resolve_akasha_db_path(workspace=workspace, akasha_config=akasha_config)
     if not sessions_db.exists():
         raise FileNotFoundError(f"sessions.db 不存在: {sessions_db}")
